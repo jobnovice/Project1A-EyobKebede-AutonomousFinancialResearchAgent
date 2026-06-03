@@ -31,6 +31,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 import anthropic
+from anthropic.types import TextBlock
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
@@ -117,7 +118,10 @@ def _call_llm(system: str, user: str, temperature: float = 0.2) -> str:
         system=system,
         messages=[{"role": "user", "content": user}],
     )
-    return response.content[0].text
+    for block in response.content:
+        if isinstance(block, TextBlock):
+            return block.text
+    raise RuntimeError("No text content in LLM response")
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +175,8 @@ def node_analyze_query(state: ResearchState) -> ResearchState:
                  "YOY", "TTM", "IPO", "EPS", "DCF", "SEC", "FOR", "AND", "THE"}
     companies = [t for t in tickers if t not in stopwords]
 
-    logger.info("Query analyzed: type=%s | companies=%s", query_type, companies)
+    logger.info("Query analyzed: type=%s | companies=%s",
+                query_type, companies)
 
     return {
         **state,
@@ -201,7 +206,8 @@ def node_plan(state: ResearchState) -> ResearchState:
         steps = plan.steps
         logger.info("Plan created: %s | %d steps", plan.plan_id, len(steps))
     except Exception as e:
-        logger.error("Planning failed: %s — using fallback single-step plan", e)
+        logger.error(
+            "Planning failed: %s — using fallback single-step plan", e)
         state["error_log"].append(f"Planning LLM error: {e}")
         steps = [{
             "step_id": 1,
@@ -244,7 +250,8 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
         return {**state, "current_step_index": idx}
 
     step = plan[idx]
-    logger.info("Executing step %d/%d: %s", idx + 1, len(plan), step["description"])
+    logger.info("Executing step %d/%d: %s", idx +
+                1, len(plan), step["description"])
 
     gathered = state.get("gathered_data", {})
     tool_log = state.get("tool_call_log", [])
@@ -253,13 +260,15 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
 
     # Guard: global iteration limit
     if iteration_count >= MAX_ITERATIONS:
-        logger.warning("Max iterations (%d) reached — terminating execution.", MAX_ITERATIONS)
+        logger.warning(
+            "Max iterations (%d) reached — terminating execution.", MAX_ITERATIONS)
         state["error_log"].append("Max iteration limit reached.")
         return {**state, "current_step_index": len(plan)}
 
     # Guard: global tool call limit
     if total_calls >= MAX_TOOL_CALLS:
-        logger.warning("Max tool calls (%d) reached — skipping remaining steps.", MAX_TOOL_CALLS)
+        logger.warning(
+            "Max tool calls (%d) reached — skipping remaining steps.", MAX_TOOL_CALLS)
         state["error_log"].append("Max tool call limit reached.")
         return {**state, "current_step_index": len(plan)}
 
@@ -279,14 +288,17 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
             llm_response = _call_llm(system_prompt, user_msg)
             react = parse_react_step(llm_response)
         except Exception as e:
-            logger.error("ReAct parse error on step %d cycle %d: %s", idx, cycle, e)
-            state["error_log"].append(f"ReAct parse error step {idx} cycle {cycle}: {e}")
+            logger.error(
+                "ReAct parse error on step %d cycle %d: %s", idx, cycle, e)
+            state["error_log"].append(
+                f"ReAct parse error step {idx} cycle {cycle}: {e}")
             break
 
         # Execute the tool
         tool_result = {}
         if react.tool_name:
-            tool_result = _execute_tool(react.tool_name, react.tool_params, mock_data)
+            tool_result = _execute_tool(
+                react.tool_name, react.tool_params, mock_data)
             total_calls += 1
             iteration_count += 1
 
@@ -308,7 +320,8 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
         # Evaluate decision
         decision = react.decision
         if decision == "step_complete":
-            logger.info("Step %d complete after %d cycle(s).", idx + 1, cycle + 1)
+            logger.info("Step %d complete after %d cycle(s).",
+                        idx + 1, cycle + 1)
             step_complete = True
             break
         elif decision == "fallback_needed":
@@ -318,15 +331,18 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
                 step = {**step, "tool": fallback, "fallback_if_fails": None}
             else:
                 logger.warning("No fallback available for step %d.", idx + 1)
-                state["error_log"].append(f"Step {idx + 1} failed, no fallback.")
+                state["error_log"].append(
+                    f"Step {idx + 1} failed, no fallback.")
                 step_complete = True  # Move on regardless
                 break
         elif decision == "plan_revision_needed":
             logger.info("Plan revision triggered at step %d.", idx + 1)
-            state["plan_revision_count"] = state.get("plan_revision_count", 0) + 1
+            state["plan_revision_count"] = state.get(
+                "plan_revision_count", 0) + 1
             break
         elif decision == "conflict_detected":
-            logger.warning("Conflict detected at step %d — logging for synthesis.", idx + 1)
+            logger.warning(
+                "Conflict detected at step %d — logging for synthesis.", idx + 1)
             state["conflicts_detected"].append({
                 "step_id": step["step_id"],
                 "tool": react.tool_name,
@@ -445,7 +461,7 @@ def node_generate_report(state: ResearchState) -> ResearchState:
             f"⚠️ **Verification Warning:** {hallucination_count} claim(s) could not be "
             f"verified against source data and have been flagged for review.\n"
         )
-        final = draft + disclaimer
+        final = draft + disclaimer # type: ignore
     else:
         final = draft
 

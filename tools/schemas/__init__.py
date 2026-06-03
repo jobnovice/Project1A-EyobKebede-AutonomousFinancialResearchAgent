@@ -73,7 +73,7 @@ SCHEMA_MAP: dict[str, dict] = {schema["name"]: schema for schema in ALL_SCHEMAS}
 # Tier classification — used by SynthesisEngine for source reliability weighting
 # Mirrors Section 7.1 of architecture_specification.md (corrected hierarchy)
 # ---------------------------------------------------------------------------
-TOOL_TIER: dict[str, int] = {
+TOOL_TIER: dict[str, int | None] = {
     "sec_filing_search":   1,   # Tier 1: Trust weight 1.00 — legally mandated, audited
     "financial_data_api":  2,   # Tier 2: Trust weight 0.90 — curated, professional controls
     "earnings_transcript": 3,   # Tier 3: Trust weight 0.75 — direct management voice
