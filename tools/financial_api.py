@@ -28,18 +28,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-FMP_BASE   = "https://financialmodelingprep.com/api/v3"
+FMP_BASE   = "https://financialmodelingprep.com/stable"  # Updated to modern stable routing
 AV_BASE    = "https://www.alphavantage.co/query"
 RATE_DELAY = 0.25   # ~4 req/sec — conservative for free tier
 
-# FMP endpoint map per statement_type
+# FMP endpoint map per statement_type (Flattened paths - tickers moved to parameters)
 FMP_ENDPOINTS = {
-    "income_statement":  "/income-statement/{ticker}",
-    "balance_sheet":     "/balance-sheet-statement/{ticker}",
-    "cash_flow":         "/cash-flow-statement/{ticker}",
-    "key_metrics":       "/key-metrics/{ticker}",
-    "financial_ratios":  "/ratios/{ticker}",
-    "earnings":          "/earnings/{ticker}",
+    "income_statement":  "/income-statement",
+    "balance_sheet":     "/balance-sheet-statement",
+    "cash_flow":         "/cash-flow-statement",
+    "key_metrics":       "/key-metrics",
+    "financial_ratios":  "/ratios",
+    "earnings":          "/earnings",
 }
 
 # Alpha Vantage function map per statement_type
@@ -80,8 +80,15 @@ def _fetch_fmp(
     api_key: str,
 ) -> list[dict]:
     """Fetch data from FMP and return a list of period records."""
-    endpoint = FMP_ENDPOINTS[statement_type].format(ticker=ticker)
-    params = urlencode({"period": period, "limit": limit, "apikey": api_key})
+    endpoint = FMP_ENDPOINTS[statement_type]
+    
+    # Modernized parameter signature maps ticker via 'symbol' query parameter
+    params = urlencode({
+        "symbol": ticker,
+        "period": period,
+        "limit": limit,
+        "apikey": api_key
+    })
     url = f"{FMP_BASE}{endpoint}?{params}"
 
     logger.info("FMP request: %s %s %s", ticker, statement_type, period)
@@ -122,14 +129,12 @@ def _fetch_alpha_vantage(
 
     if "Note" in data:
         raise RuntimeError("Alpha Vantage rate limit hit.")
-    if isinstance(data, dict) and "Information" in data:
-        raise RuntimeError(f"Alpha Vantage API issue: {data.get('Information')}")
+    if "Information" in data:
+        raise RuntimeError(f"Alpha Vantage API issue: {data['Information']}")#type: ignore
 
     # AV returns annual/quarterly reports under different keys
     period_key = "annualReports" if period == "annual" else "quarterlyReports"
-    if not isinstance(data, dict):
-        raise RuntimeError("Alpha Vantage returned unexpected data format")
-    reports = data.get(period_key, [])
+    reports = data.get(period_key, [])#type: ignore
 
     if not reports:
         raise RuntimeError(f"Alpha Vantage returned no {period} data for {ticker}")
@@ -170,7 +175,8 @@ def financial_data_api(
     ticker: str,
     statement_type: str = "key_metrics",
     period: str = "annual",
-    limit: int = 4,
+    years: int = 3,
+    **kwargs
 ) -> dict:
     """
     Retrieve structured financial statements or metrics for a US-listed company.
@@ -180,7 +186,8 @@ def financial_data_api(
         statement_type:  One of: income_statement | balance_sheet | cash_flow |
                          key_metrics | financial_ratios | earnings
         period:          'annual' or 'quarterly'
-        limit:           Number of periods to return (default 4 = 4 years or quarters)
+        years:           Number of periods to return (1-10). Default 3 = 3 years/quarters.
+        **kwargs:        Additional parameters (ignored, for schema compatibility).
 
     Returns:
         dict with keys:
@@ -188,6 +195,8 @@ def financial_data_api(
             record_count, data_source, source_tier, source_weight,
             retrieved_at, error
     """
+    # Map 'years' to internal 'limit' parameter
+    limit = max(1, min(10, years))
     ticker = ticker.upper().strip()
     if statement_type not in FMP_ENDPOINTS:
         return _error_response(

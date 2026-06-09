@@ -269,3 +269,4 @@ def _error_response(ticker: str, form: str, message: str) -> dict:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+

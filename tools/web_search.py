@@ -176,6 +176,8 @@ def web_search(
     query: str,
     num_results: int = 10,
     date_range: str = "any",
+    search_type: str = "news",
+    **kwargs
 ) -> dict:
     """
     Search the web for current news, analyst commentary, and recent events.
@@ -184,6 +186,8 @@ def web_search(
         query:       Specific search query including company name and topic.
         num_results: Number of results to return (1–20, default 10).
         date_range:  One of: past_day | past_week | past_month | past_year | any
+        search_type: (Ignored) One of 'news', 'general', 'financial' – kept for schema compatibility.
+        **kwargs:    Additional parameters (ignored).
 
     Returns:
         dict with keys:

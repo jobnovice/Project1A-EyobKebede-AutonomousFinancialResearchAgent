@@ -31,7 +31,6 @@ from datetime import datetime
 from typing import Any, Optional
 
 import anthropic
-from anthropic.types import TextBlock
 from langgraph.graph import StateGraph, END
 from typing_extensions import TypedDict
 
@@ -49,6 +48,30 @@ from agent.parser import (
     ReActStep,
 )
 from tools.schemas import ALL_SCHEMAS
+
+# Real tool implementations (Days 5–7)
+# Only import tools that are fully implemented — stubs stay as None
+from tools.sec_edgar          import sec_filing_search
+from tools.financial_api      import financial_data_api
+from tools.web_search         import web_search
+from tools.news_sentiment     import news_sentiment
+from tools.company_profile    import company_profile
+from memory.vector_db_tools   import vector_db_search, vector_db_store
+from memory.context_manager   import ContextManager
+from memory.episodic           import get_episodic_memory
+
+# Dispatch table: tool_name → callable
+# Stubs (not yet built) fall through to the stub response in _execute_tool
+TOOL_DISPATCH: dict[str, Any] = {
+    "sec_filing_search":  sec_filing_search,
+    "financial_data_api": financial_data_api,
+    "web_search":         web_search,
+    "news_sentiment":     news_sentiment,
+    "company_profile":    company_profile,
+    "vector_db_search":   vector_db_search,   # Day 6
+    "vector_db_store":    vector_db_store,    # Day 6
+    # Day 7: peer_comparison, earnings, calculator, fact_checker, report_gen
+}
 
 logger = logging.getLogger(__name__)
 
@@ -118,32 +141,68 @@ def _call_llm(system: str, user: str, temperature: float = 0.2) -> str:
         system=system,
         messages=[{"role": "user", "content": user}],
     )
-    for block in response.content:
-        if isinstance(block, TextBlock):
-            return block.text
-    raise RuntimeError("No text content in LLM response")
+    return response.content[0].text#type: ignore
 
 
 # ---------------------------------------------------------------------------
-# Mock tool executor (used until real tools are wired in Days 5–7)
+# Tool executor — real dispatch with mock override for testing
 # ---------------------------------------------------------------------------
 
 def _execute_tool(tool_name: str, params: dict, mock_data: Optional[dict] = None) -> dict:
     """
     Execute a tool call.
-    If mock_data contains a key matching tool_name, return mock data.
-    Otherwise return a stub response indicating the tool is not yet implemented.
+
+    Priority:
+      1. If mock_data contains tool_name → return mock result (test mode)
+      2. If tool_name is in TOOL_DISPATCH → call the real implementation
+      3. Otherwise → return stub response (tool not yet implemented)
+
+    All real tool calls are wrapped in try/except so a failure returns a
+    structured error dict instead of crashing the agent. The executor's
+    fallback logic then handles the error via the fallback chain.
     """
+    # 1. Mock override (testing / offline runs)
     if mock_data and tool_name in mock_data:
         logger.info("MOCK tool call: %s | params=%s", tool_name, params)
         return {"source": tool_name, "data": mock_data[tool_name], "mock": True}
 
+    # 2. Real tool dispatch
+    if tool_name in TOOL_DISPATCH:
+        fn = TOOL_DISPATCH[tool_name]
+        logger.info("REAL tool call: %s | params=%s", tool_name, params)
+        try:
+            result = fn(**params)
+            # All real tools return a dict with an 'error' key
+            if result.get("error"):
+                logger.warning("Tool %s returned error: %s", tool_name, result["error"])
+            return result
+        except TypeError as e:
+            # Param mismatch — log and return structured error
+            logger.error("Tool %s param error: %s | params=%s", tool_name, e, params)
+            return _tool_error(tool_name, f"Parameter error: {e}")
+        except Exception as e:
+            logger.error("Tool %s raised unexpected error: %s", tool_name, e)
+            return _tool_error(tool_name, str(e))
+
+    # 3. Stub — tool not yet implemented
     logger.info("STUB tool call: %s | params=%s", tool_name, params)
     return {
         "source": tool_name,
         "data": None,
         "mock": False,
-        "note": f"Tool '{tool_name}' not yet implemented. Scheduled for Days 5–7.",
+        "error": None,
+        "note": f"Tool '{tool_name}' not yet implemented. Scheduled for Days 6–7.",
+    }
+
+
+def _tool_error(tool_name: str, message: str) -> dict:
+    """Structured error response — signals the executor to try a fallback."""
+    return {
+        "source":  tool_name,
+        "data":    None,
+        "mock":    False,
+        "error":   message,
+        "note":    f"Tool '{tool_name}' failed: {message}",
     }
 
 
@@ -168,15 +227,27 @@ def node_analyze_query(state: ResearchState) -> ResearchState:
     else:
         query_type = "factual"
 
-    # Extract known ticker patterns (uppercase 1–5 letter words)
-    tickers = re.findall(r'\b[A-Z]{1,5}\b', state["raw_query"])
-    # Filter out common non-ticker uppercase words
-    stopwords = {"A", "I", "AI", "CEO", "CFO", "US", "UK", "Q1", "Q2", "Q3", "Q4",
-                 "YOY", "TTM", "IPO", "EPS", "DCF", "SEC", "FOR", "AND", "THE"}
-    companies = [t for t in tickers if t not in stopwords]
+    # Company name → ticker mapping (handles natural language queries without tickers)
+    NAME_TO_TICKER = {
+        "microsoft": "MSFT", "apple": "AAPL", "google": "GOOGL",
+        "alphabet": "GOOGL", "amazon": "AMZN", "meta": "META",
+        "tesla": "TSLA", "nvidia": "NVDA", "netflix": "NFLX",
+        "salesforce": "CRM", "adobe": "ADBE", "intel": "INTC",
+        "ibm": "IBM", "oracle": "ORCL", "qualcomm": "QCOM",
+        "jpmorgan": "JPM", "goldman": "GS", "visa": "V",
+        "walmart": "WMT", "pfizer": "PFE",
+    }
+    query_lower = state["raw_query"].lower()
+    companies = [ticker for name, ticker in NAME_TO_TICKER.items() if name in query_lower]
 
-    logger.info("Query analyzed: type=%s | companies=%s",
-                query_type, companies)
+    # Also catch explicit ticker symbols (uppercase 1–5 letter words)
+    stopwords = {"A", "I", "AI", "CEO", "CFO", "US", "UK", "Q1", "Q2", "Q3", "Q4",
+                 "YOY", "TTM", "IPO", "EPS", "DCF", "SEC", "FOR", "AND", "THE", "INC"}
+    explicit = [t for t in re.findall(r'\b[A-Z]{1,5}\b', state["raw_query"])
+                if t not in stopwords and t not in companies]
+    companies = list(dict.fromkeys(companies + explicit))
+
+    logger.info("Query analyzed: type=%s | companies=%s", query_type, companies)
 
     return {
         **state,
@@ -193,11 +264,23 @@ def node_plan(state: ResearchState) -> ResearchState:
     logger.info("Planning for query: %s", state["raw_query"])
 
     system_prompt = build_planner_prompt(ALL_SCHEMAS)
+
+    # Include cache summary from memory_precheck so planner skips cached steps
+    cache_note = state.get("clarifications", "") or "No prior data in memory cache."
+
+    # Inject episodic memory — past strategies for this query type
+    try:
+        episodic_hint = get_episodic_memory().get_summary(state["query_type"])
+    except Exception as _e:
+        episodic_hint = "No episodic memory available."
+        logger.debug("Episodic memory unavailable: %s", _e)
+
     user_msg = (
         f"Query: {state['raw_query']}\n"
         f"Query type: {state['query_type']}\n"
         f"Companies identified: {state['companies']}\n"
-        f"Memory precheck: No prior data found (Day 3 memory not yet integrated)."
+        f"Memory precheck results: {cache_note}\n"
+        f"Episodic memory (past sessions): {episodic_hint}"
     )
 
     try:
@@ -206,8 +289,7 @@ def node_plan(state: ResearchState) -> ResearchState:
         steps = plan.steps
         logger.info("Plan created: %s | %d steps", plan.plan_id, len(steps))
     except Exception as e:
-        logger.error(
-            "Planning failed: %s — using fallback single-step plan", e)
+        logger.error("Planning failed: %s — using fallback single-step plan", e)
         state["error_log"].append(f"Planning LLM error: {e}")
         steps = [{
             "step_id": 1,
@@ -226,17 +308,94 @@ def node_plan(state: ResearchState) -> ResearchState:
     }
 
 
+# Similarity threshold for treating a memory hit as sufficient to skip an API call
+MEMORY_HIT_THRESHOLD = 0.85
+
+
 def node_memory_precheck(state: ResearchState) -> ResearchState:
     """
-    Check long-term vector memory before executing any external tool calls.
-    Memory First principle — stub until vector_store.py is wired (Day 8).
+    Search long-term vector memory BEFORE the planner makes any external API calls.
+    Implements the Memory First principle from architecture spec Section 2.2.
+
+    What this does:
+      1. Formulates a retrieval query from the raw query + identified companies.
+      2. Calls vector_db_search for each company to find cached research.
+      3. Any result with similarity >= MEMORY_HIT_THRESHOLD is loaded directly
+         into state["gathered_data"] — the planner will skip redundant API calls.
+      4. Increments state["memory_hits"] for the AB-4 metric.
+      5. Attaches a cache_summary to state so the planner knows what is
+         already available and can skip those steps in the research plan.
     """
-    logger.info("Memory precheck (stub — Day 8 will integrate ChromaDB)")
-    # No memory hit in stub — all steps proceed to live tool calls
-    return {**state, "memory_hits": state.get("memory_hits", 0)}
+    query    = state["raw_query"]
+    companies = state.get("companies", [])
+
+    gathered      = dict(state.get("gathered_data", {}))
+    memory_hits   = state.get("memory_hits", 0)
+    cache_summary: list[str] = []
+
+    for ticker in companies:
+        # Build a targeted retrieval query per company
+        search_query = f"{ticker} {query}"
+
+        try:
+            result = TOOL_DISPATCH["vector_db_search"](
+                query=search_query,
+                top_k=5,
+                metadata_filter={"ticker": ticker},
+                min_similarity=MEMORY_HIT_THRESHOLD,
+            )
+        except Exception as e:
+            logger.warning("Memory precheck failed for %s: %s", ticker, e)
+            continue
+
+        hits = result.get("results", [])
+        if not hits:
+            logger.info("Memory precheck: no cache hit for %s (collection=%d)",
+                        ticker, result.get("collection_size", 0))
+            continue
+
+        # Load each hit into gathered_data with a memory source tag
+        for hit in hits:
+            key = f"memory_{ticker}_{hit.get('metadata', {}).get('source_type', 'doc')}"
+            gathered[key] = {
+                "source":      "vector_db_search",
+                "data":        hit["content"],
+                "metadata":    hit.get("metadata", {}),
+                "similarity":  hit["similarity"],
+                "memory_hit":  True,
+            }
+            memory_hits += 1
+
+        # Build a one-line summary for the planner
+        top_sim   = result.get("top_similarity", 0.0)
+        hit_count = len(hits)
+        source_types = list({
+            h.get("metadata", {}).get("source_type", "unknown") for h in hits
+        })
+        summary = (
+            f"{ticker}: {hit_count} cached chunk(s) found "
+            f"(top similarity {top_sim:.2f}, types: {source_types})"
+        )
+        cache_summary.append(summary)
+        logger.info("Memory precheck HIT: %s", summary)
+
+    # Attach cache_summary to state so node_plan can inject it into the
+    # planner prompt — the planner will then skip already-cached steps
+    clarifications = state.get("clarifications") or ""
+    if cache_summary:
+        lines = [f"  - {s}" for s in cache_summary]
+        cache_note = "MEMORY CACHE AVAILABLE:" + "\n" + "\n".join(lines)
+        clarifications = (clarifications + "\n" + cache_note).strip()
+
+    return {
+        **state,
+        "gathered_data":  gathered,
+        "memory_hits":    memory_hits,
+        "clarifications": clarifications,
+    }
 
 
-def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) -> ResearchState:
+def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, context_manager: Optional["ContextManager"] = None) -> ResearchState:
     """
     Execute the current plan step via a ReAct micro-loop.
     Max MAX_CYCLES_PER_STEP iterations before moving to the next step.
@@ -250,8 +409,7 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
         return {**state, "current_step_index": idx}
 
     step = plan[idx]
-    logger.info("Executing step %d/%d: %s", idx +
-                1, len(plan), step["description"])
+    logger.info("Executing step %d/%d: %s", idx + 1, len(plan), step["description"])
 
     gathered = state.get("gathered_data", {})
     tool_log = state.get("tool_call_log", [])
@@ -260,16 +418,31 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
 
     # Guard: global iteration limit
     if iteration_count >= MAX_ITERATIONS:
-        logger.warning(
-            "Max iterations (%d) reached — terminating execution.", MAX_ITERATIONS)
+        logger.warning("Max iterations (%d) reached — terminating execution.", MAX_ITERATIONS)
         state["error_log"].append("Max iteration limit reached.")
         return {**state, "current_step_index": len(plan)}
 
     # Guard: global tool call limit
     if total_calls >= MAX_TOOL_CALLS:
-        logger.warning(
-            "Max tool calls (%d) reached — skipping remaining steps.", MAX_TOOL_CALLS)
+        logger.warning("Max tool calls (%d) reached — skipping remaining steps.", MAX_TOOL_CALLS)
         state["error_log"].append("Max tool call limit reached.")
+        return {**state, "current_step_index": len(plan)}
+
+    # Context window check — compress if approaching limit
+    # Use session-scoped CM from build_graph so context accumulates across all steps
+    _cm = context_manager or ContextManager(session_id=state.get("session_id", "unknown"))
+    ctx_usage = _cm.update(state)
+    if _cm.should_summarise():
+        logger.warning(
+            "Context at %.1f%% — compressing TAO traces before step %d.",
+            ctx_usage["pct_used"], idx + 1,
+        )
+        tool_log = _cm.summarise(
+            state, llm_call_fn=_call_llm, keep_recent=3
+        )
+    if not _cm.has_headroom():
+        logger.error("No headroom for step %d — halting.", idx + 1)
+        state["error_log"].append("Context window full — execution halted.")
         return {**state, "current_step_index": len(plan)}
 
     # ReAct micro-loop (max MAX_CYCLES_PER_STEP cycles per step)
@@ -288,17 +461,14 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
             llm_response = _call_llm(system_prompt, user_msg)
             react = parse_react_step(llm_response)
         except Exception as e:
-            logger.error(
-                "ReAct parse error on step %d cycle %d: %s", idx, cycle, e)
-            state["error_log"].append(
-                f"ReAct parse error step {idx} cycle {cycle}: {e}")
+            logger.error("ReAct parse error on step %d cycle %d: %s", idx, cycle, e)
+            state["error_log"].append(f"ReAct parse error step {idx} cycle {cycle}: {e}")
             break
 
         # Execute the tool
         tool_result = {}
         if react.tool_name:
-            tool_result = _execute_tool(
-                react.tool_name, react.tool_params, mock_data)
+            tool_result = _execute_tool(react.tool_name, react.tool_params, mock_data)
             total_calls += 1
             iteration_count += 1
 
@@ -320,8 +490,7 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
         # Evaluate decision
         decision = react.decision
         if decision == "step_complete":
-            logger.info("Step %d complete after %d cycle(s).",
-                        idx + 1, cycle + 1)
+            logger.info("Step %d complete after %d cycle(s).", idx + 1, cycle + 1)
             step_complete = True
             break
         elif decision == "fallback_needed":
@@ -331,18 +500,15 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None) ->
                 step = {**step, "tool": fallback, "fallback_if_fails": None}
             else:
                 logger.warning("No fallback available for step %d.", idx + 1)
-                state["error_log"].append(
-                    f"Step {idx + 1} failed, no fallback.")
+                state["error_log"].append(f"Step {idx + 1} failed, no fallback.")
                 step_complete = True  # Move on regardless
                 break
         elif decision == "plan_revision_needed":
             logger.info("Plan revision triggered at step %d.", idx + 1)
-            state["plan_revision_count"] = state.get(
-                "plan_revision_count", 0) + 1
+            state["plan_revision_count"] = state.get("plan_revision_count", 0) + 1
             break
         elif decision == "conflict_detected":
-            logger.warning(
-                "Conflict detected at step %d — logging for synthesis.", idx + 1)
+            logger.warning("Conflict detected at step %d — logging for synthesis.", idx + 1)
             state["conflicts_detected"].append({
                 "step_id": step["step_id"],
                 "tool": react.tool_name,
@@ -461,7 +627,7 @@ def node_generate_report(state: ResearchState) -> ResearchState:
             f"⚠️ **Verification Warning:** {hallucination_count} claim(s) could not be "
             f"verified against source data and have been flagged for review.\n"
         )
-        final = draft + disclaimer # type: ignore
+        final = draft + disclaimer#type: ignore
     else:
         final = draft
 
@@ -525,7 +691,7 @@ def should_continue_execution(state: ResearchState) -> str:
 # Graph builder
 # ---------------------------------------------------------------------------
 
-def build_graph(mock_data: Optional[dict] = None) -> Any:
+def build_graph(mock_data: Optional[dict] = None, session_cm: Optional["ContextManager"] = None) -> Any:
     """
     Construct and compile the ARA-1 LangGraph StateGraph.
 
@@ -537,9 +703,15 @@ def build_graph(mock_data: Optional[dict] = None) -> Any:
     """
     graph = StateGraph(ResearchState)
 
-    # Wrap execute_step to pass mock_data
+    # Use the CM passed in from run_agent (created fresh per query in run_agent).
+    # Fallback to a new instance only when build_graph is called directly (e.g. tests).
+    _session_cm = session_cm or ContextManager(
+        session_id=f"session-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    )
+
+    # Wrap execute_step to pass mock_data and the session-scoped CM
     def _execute(state):
-        return node_execute_step(state, mock_data=mock_data)
+        return node_execute_step(state, mock_data=mock_data, context_manager=_session_cm)
 
     # Register nodes
     graph.add_node("analyze_query", node_analyze_query)
@@ -555,9 +727,9 @@ def build_graph(mock_data: Optional[dict] = None) -> Any:
     graph.set_entry_point("analyze_query")
 
     # Linear edges
-    graph.add_edge("analyze_query", "plan")
-    graph.add_edge("plan", "memory_precheck")
-    graph.add_edge("memory_precheck", "execute_step")
+    graph.add_edge("analyze_query", "memory_precheck")
+    graph.add_edge("memory_precheck", "plan")
+    graph.add_edge("plan", "execute_step")
 
     # Conditional loop: keep executing steps or move to synthesis
     graph.add_conditional_edges(
@@ -621,11 +793,20 @@ def run_agent(query: str, mock_data: Optional[dict] = None) -> ResearchState:
         "error_log": [],
     }
 
-    app = build_graph(mock_data=mock_data)
+    # Create a fresh ContextManager per query — never reuse across sessions
+    session_cm = ContextManager(session_id=session_id)
+    app = build_graph(mock_data=mock_data, session_cm=session_cm)
     final_state = app.invoke(initial_state)
 
     elapsed = round(time.time() - start, 2)
     final_state["evaluation_metrics"]["AB-5_latency_seconds"] = elapsed
     logger.info("ARA-1 complete | session=%s | %.2fs", session_id, elapsed)
+
+    # Log completed session to episodic memory for future planner use
+    try:
+        get_episodic_memory().log_session(final_state)
+        logger.info("Session logged to episodic memory.")
+    except Exception as _e:
+        logger.warning("Episodic memory log failed (non-critical): %s", _e)
 
     return final_state
