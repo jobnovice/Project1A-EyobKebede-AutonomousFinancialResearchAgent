@@ -431,14 +431,14 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
     # Context window check — compress if approaching limit
     # Use session-scoped CM from build_graph so context accumulates across all steps
     _cm = context_manager or ContextManager(session_id=state.get("session_id", "unknown"))
-    ctx_usage = _cm.update(state)
+    ctx_usage = _cm.update(state)#type: ignore
     if _cm.should_summarise():
         logger.warning(
             "Context at %.1f%% — compressing TAO traces before step %d.",
             ctx_usage["pct_used"], idx + 1,
         )
         tool_log = _cm.summarise(
-            state, llm_call_fn=_call_llm, keep_recent=3
+            state, llm_call_fn=_call_llm, keep_recent=3#type: ignore
         )
     if not _cm.has_headroom():
         logger.error("No headroom for step %d — halting.", idx + 1)

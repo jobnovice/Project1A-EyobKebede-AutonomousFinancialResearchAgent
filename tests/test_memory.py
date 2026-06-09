@@ -44,7 +44,7 @@ def _install_chromadb_stub():
     chroma_utils = types.ModuleType("chromadb.utils")
     chroma_ef    = types.ModuleType("chromadb.utils.embedding_functions")
 
-    chroma_cfg.Settings = type("Settings", (), {"__init__": lambda s, **k: None})
+    chroma_cfg.Settings = type("Settings", (), {"__init__": lambda s, **k: None})#type: ignore
 
     class _FakeCollection:
         """In-memory collection that mimics ChromaDB behaviour."""
@@ -95,7 +95,7 @@ def _install_chromadb_stub():
                 self._collections[name] = _FakeCollection()
             return self._collections[name]
 
-    chroma.PersistentClient = lambda path, settings: _FakeClient()
+    chroma.PersistentClient = lambda path, settings: _FakeClient()#type: ignore
 
     for mod, obj in [
         ("chromadb", chroma),
