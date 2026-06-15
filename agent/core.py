@@ -50,27 +50,34 @@ from agent.parser import (
 from tools.schemas import ALL_SCHEMAS
 
 # Real tool implementations (Days 5–7)
-# Only import tools that are fully implemented — stubs stay as None
 from tools.sec_edgar          import sec_filing_search
 from tools.financial_api      import financial_data_api
 from tools.web_search         import web_search
 from tools.news_sentiment     import news_sentiment
 from tools.company_profile    import company_profile
+from tools.peer_comparison    import peer_comparison
+from tools.earnings           import earnings_transcript
+from tools.calculator         import calculation_engine
+from tools.fact_checker       import fact_checker
+from tools.report_gen         import report_generator
 from memory.vector_db_tools   import vector_db_search, vector_db_store
 from memory.context_manager   import ContextManager
-from memory.episodic           import get_episodic_memory
+from memory.episodic          import get_episodic_memory
 
 # Dispatch table: tool_name → callable
-# Stubs (not yet built) fall through to the stub response in _execute_tool
 TOOL_DISPATCH: dict[str, Any] = {
-    "sec_filing_search":  sec_filing_search,
-    "financial_data_api": financial_data_api,
-    "web_search":         web_search,
-    "news_sentiment":     news_sentiment,
-    "company_profile":    company_profile,
-    "vector_db_search":   vector_db_search,   # Day 6
-    "vector_db_store":    vector_db_store,    # Day 6
-    # Day 7: peer_comparison, earnings, calculator, fact_checker, report_gen
+    "sec_filing_search":   sec_filing_search,
+    "financial_data_api":  financial_data_api,
+    "web_search":          web_search,
+    "news_sentiment":      news_sentiment,
+    "company_profile":     company_profile,
+    "peer_comparison":     peer_comparison,
+    "earnings_transcript": earnings_transcript,
+    "calculation_engine":  calculation_engine,
+    "fact_checker":        fact_checker,
+    "report_generator":    report_generator,
+    "vector_db_search":    vector_db_search,
+    "vector_db_store":     vector_db_store,
 }
 
 logger = logging.getLogger(__name__)
@@ -207,7 +214,7 @@ def _tool_error(tool_name: str, message: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Graph Nodes
+# Graph Nodes (unchanged from previous version)
 # ---------------------------------------------------------------------------
 
 def node_analyze_query(state: ResearchState) -> ResearchState:
@@ -429,7 +436,6 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
         return {**state, "current_step_index": len(plan)}
 
     # Context window check — compress if approaching limit
-    # Use session-scoped CM from build_graph so context accumulates across all steps
     _cm = context_manager or ContextManager(session_id=state.get("session_id", "unknown"))
     ctx_usage = _cm.update(state)#type: ignore
     if _cm.should_summarise():
@@ -437,9 +443,7 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
             "Context at %.1f%% — compressing TAO traces before step %d.",
             ctx_usage["pct_used"], idx + 1,
         )
-        tool_log = _cm.summarise(
-            state, llm_call_fn=_call_llm, keep_recent=3#type: ignore
-        )
+        tool_log = _cm.summarise(state, llm_call_fn=_call_llm, keep_recent=3)#type: ignore
     if not _cm.has_headroom():
         logger.error("No headroom for step %d — halting.", idx + 1)
         state["error_log"].append("Context window full — execution halted.")
@@ -697,6 +701,7 @@ def build_graph(mock_data: Optional[dict] = None, session_cm: Optional["ContextM
 
     Args:
         mock_data: Optional dict of {tool_name: mock_result} for testing.
+        session_cm: Optional ContextManager (must be created per session and passed).
 
     Returns:
         Compiled LangGraph app.
@@ -704,7 +709,6 @@ def build_graph(mock_data: Optional[dict] = None, session_cm: Optional["ContextM
     graph = StateGraph(ResearchState)
 
     # Use the CM passed in from run_agent (created fresh per query in run_agent).
-    # Fallback to a new instance only when build_graph is called directly (e.g. tests).
     _session_cm = session_cm or ContextManager(
         session_id=f"session-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
     )
