@@ -377,9 +377,15 @@ def format_degradation_notes(chain_results: list[ChainResult]) -> str:
     lines: list[str] = []
     for cr in chain_results:
         if cr.degraded:
-            lines.append(f"- ❌ **{cr.primary_tool}** — [DATA UNAVAILABLE]. {cr.disclosure.replace('[DATA UNAVAILABLE] ', '')}")
+            disclosure = cr.disclosure or cr.result.get(
+                "degradation_note", "No fallback produced usable data."
+            )
+            lines.append(
+                f"- ❌ **{cr.primary_tool}** — [DATA UNAVAILABLE]. "
+                f"{disclosure.removeprefix('[DATA UNAVAILABLE] ')}"
+            )
         elif cr.used_fallback:
-            lines.append(f"- ⚠️ {cr.disclosure}")
+            lines.append(f"- ⚠️ {cr.disclosure or f'Fallback used for {cr.primary_tool}.'}")
     if not lines:
         return ""
     return "\n".join(["## Data Availability Notes",
