@@ -1,18 +1,74 @@
 # ARA-1: Autonomous Financial Research Agent
 ## Project1A-EyobKebede-AutonomousFinancialResearchAgent
 
-> **ZeTheta 15-Day Agentic AI Project**  
-> Candidate: Eyob Kebede | Day 3 of 15 | Status: Foundation Complete
+> 15-Day Agentic AI Project | **Day 9 of 15 in progress** | Version 0.9
 
 ---
 
 ## What This Project Is
 
-ARA-1 is a purpose-built agentic AI system that replicates the core workflow of a junior financial analyst — finding data from multiple sources, reconciling conflicts, and producing structured investment research reports — at a fraction of the cost and time.
+ARA-1 is a purpose-built agentic AI system that replicates the core workflow of a junior financial analyst: finding data from multiple sources, reconciling conflicts, and producing structured research reports. A junior analyst takes 2-5 days to produce a comprehensive report. ARA-1 targets sub-5-minute delivery.
 
-A junior analyst costs $80K–$120K/year and takes 2–5 days to produce a comprehensive research report. ARA-1 targets sub-5-minute delivery with comparable output quality.
+**ARA-1 is not a chatbot.** It does not answer single-turn prompts, make investment recommendations, or fabricate data when sources are unavailable. It degrades gracefully and says so in the output.
 
-**ARA-1 is not a chatbot.** It does not respond to single-turn prompts, make investment recommendations, or fabricate data when sources are unavailable. It degrades gracefully and transparently.
+---
+
+## Current Status
+
+**Legend:** ✅ built and validated | 🟡 built, not yet wired or fully tested | ⏳ not started | 👤 built outside the assistant sessions, not re-reviewed
+
+### Where we are right now
+
+Day 9 (error handling) is partly done. Retry/degradation and the fallback-chain executor are built and tested in isolation. The circuit breaker is next, followed by wiring all of it into `agent/core.py`. After that comes Challenge 6.
+
+### Progress by day
+
+| Day | Scope | Status |
+|-----|-------|--------|
+| 1 | Architecture spec, error log, system diagram | ✅ |
+| 2 | 12 tool schemas, repo scaffold | ✅ |
+| 3 | Environment setup, LLM integration, ChromaDB init | ✅ |
+| 4 | Core agent loop (`prompts.py`, `parser.py`, `core.py`) | ✅ Challenge 1 validated with mock data |
+| 5 | Real API tools: SEC EDGAR, financial data, web search, news sentiment, company profile | ✅ Challenges 1-2 pass in **mock mode only**; live-API runs not done |
+| 6 | Memory: vector store, context manager, episodic memory | ✅ 39 tests in `tests/test_memory.py` |
+| 7 | Remaining tools: earnings, peer comparison, calculator, fact checker, report generator | ✅ per owner. Tools not all wired into `TOOL_DISPATCH`; Challenges 3-4 results not recorded |
+| 8 | Synthesis: conflict resolver, narrative, engine | ✅ engine wired into `node_synthesize` |
+| 9 | Error handling | 🟡 in progress, see below |
+| 10 | Query analysis and disambiguation, Challenge 7 | ⏳ |
+| 11+ | Evaluation dashboard, remaining challenges, stress testing, documentation (Day 14), final submission | ⏳ `evaluation/metrics.py` was built ahead of schedule |
+
+### Day 9 breakdown
+
+| Deliverable | Status |
+|-------------|--------|
+| `agent/error_handler.py`: retry with exponential backoff, `[DATA UNAVAILABLE]` degradation, failure injector | ✅ |
+| `agent/fallback_chains.py`: chain executor, parameter translation, usable-data check, disclosure notes | ✅ not yet wired into `core.py` |
+| `agent/circuit_breaker.py` | ⏳ next. Interface it must provide: `allow(tool)`, `record_success(tool)`, `record_failure(tool)` |
+| Wire error handling + fallbacks + breaker into `core.py` | ⏳ |
+| `results/challenge_6.md` (ambiguous query handling) | ⏳ |
+| Failure injection against the full agent | ⏳ (done against the chain executor only: at a 50% injected failure rate, retries alone recovered 89.7% of calls and retries plus fallbacks recovered 100%, over 300 seeded runs) |
+
+### Validation evidence
+
+| Suite | Result |
+|-------|--------|
+| `tests/test_memory.py` | 39 tests pass |
+| `tests/test_challenges_1_2.py` | Challenges 1-2 pass in mock mode |
+| `tests/test_day4_challenge1.py` | Day 4 validation passes |
+| Synthesis, evaluation metrics, error handling, fallback chains | Validated by inline runs during development (conflict resolver, narrative, engine, 26 metrics, 8 error-handler checks, 14 fallback-chain checks). **Not yet saved as test files.** |
+
+Test files are script-style runners that stub external packages (`chromadb`, `anthropic`, `langgraph`) at import time. Run them one at a time, not together under a single `pytest` session.
+
+### Known open items
+
+1. **`.env.example` key mismatch:** it lists `ALPHA_VANTAGE_API_KEY`, but `tools/financial_api.py` reads `ALPHA_VANTAGE_KEY`. Until one is renamed, the Alpha Vantage fallback is silently disabled.
+2. **Tools not yet in `TOOL_DISPATCH`:** `peer_comparison`, `calculation_engine`, `fact_checker`, `report_generator`. Wiring is deferred until all tools are done.
+3. **No automatic memory write:** the graph has no step that stores verified findings in long-term memory at session end. `vector_db_store` is only used if the plan calls it, so cross-session cache hits depend on that. Challenge 7 (memory-driven research) needs this.
+4. **Fallback results must be filed under the tool that produced them** (use `gathered_key()` from `fallback_chains.py`). Synthesis parses each record by the tool name in its key.
+5. **`node_evaluate` and `node_generate_report` are still basic.** `evaluation/metrics.py` (26 metrics) and `tools/report_gen.py` are not yet connected to them.
+6. **`fact_checker` (👤):** confirm it calls `financial_data_api(..., limit=1)` (not `years=`) and returns a `verified` boolean. `vector_db_store` depends on that flag.
+7. **Live-API runs:** Challenges 1-2 have only been run with mock data.
+8. **Embedding model:** without an OpenAI key, `vector_store.py` falls back to a local 384-dimension model. Do not mix embedding models in one ChromaDB collection.
 
 ---
 
@@ -22,34 +78,31 @@ A junior analyst costs $80K–$120K/year and takes 2–5 days to produce a compr
 User Query
     │
     ▼
-Query Analyzer + Disambiguation
+analyze_query              ← heuristic today; query_analyzer + disambiguation arrive Day 10
     │
     ▼
-Planner LLM (Claude Sonnet 4)    ← generates structured research plan
+memory_precheck            ← vector_db_search per company; hits (>= 0.85 similarity) load into gathered_data
     │
     ▼
-Executor (ReAct Micro-Loop)      ← Memory First → Tool → Observe → Adapt
-    │
-    ├── Tool Registry (12 tools, fallback chains, circuit breakers)
-    ├── Memory System (short-term context + long-term vector DB + episodic)
-    └── Error Handler (exponential backoff, graceful degradation)
+plan                       ← Planner LLM, sees cache summary + episodic memory of past sessions
     │
     ▼
-Synthesis Engine                 ← source reliability weighting, conflict resolution
+execute_step  ⟲            ← ReAct loop per plan step (max 20 tool calls, 15 iterations)
+    │                         ContextManager compresses old traces at 70% of the context window
+    ├── Tool registry (12 tools)
+    └── Error handling: retry → fallback chain → circuit breaker → degrade   (built, wiring pending)
     │
     ▼
-Verification Pipeline            ← fact-checking all numerical claims
+synthesize                 ← synthesis engine: conflict resolution, narrative threading,
+    │                         quantitative triangulation, sentiment-fact alignment
+    ▼
+verify → generate_report → evaluate
     │
     ▼
-Report Generator + Evaluation    ← 20+ quality metrics computed before delivery
-    │
-    ▼
-vector_db_store                  ← findings persisted for future sessions
+episodic.log_session       ← strategy log for future planners
 ```
 
-**Core design:** Hybrid Plan-Execute + ReAct. The Planner creates a complete roadmap before any tool is invoked. Each plan step runs a local Thought-Action-Observation loop for adaptive recovery.
-
-**Key principle:** Memory First. Before every external API call, the agent checks its long-term vector memory. This reduces cost, latency, and rate-limit exposure.
+**Key principles:** Memory First (check long-term memory before any external API call), source reliability weighting, and no fabrication (missing data is marked `[DATA UNAVAILABLE]` and disclosed).
 
 ---
 
@@ -58,91 +111,69 @@ vector_db_store                  ← findings persisted for future sessions
 ```
 Project1A-EyobKebede-AutonomousFinancialResearchAgent/
 │
-├── README.md                          ← This file
-├── ERROR_LOG.md                       ← 7 deliberate errors identified (Day 1)
-├── architecture_specification.md      ← Full system design (Day 1)
-├── requirements.txt
-├── setup.py
+├── README.md
+├── ERROR_LOG.md                       ✅ 7 deliberate errors identified (Day 1)
+├── architecture_specification.md      ✅ moves to docs/…_final.md on Day 14
+├── requirements.txt, .env.example
 │
-├── agent/                             ← Core agent logic
-│   ├── core.py                        ← LangGraph StateGraph, ResearchState
-│   ├── prompts.py                     ← System prompts (planner, executor, verifier)
-│   ├── parser.py                      ← LLM output parsing
-│   ├── query_analyzer.py              ← Query classification and entity extraction
-│   ├── disambiguation.py             ← Ambiguous query resolution
-│   ├── error_handler.py               ← Retry, backoff, graceful degradation
-│   ├── fallback_chains.py             ← Per-tool fallback sequences
-│   └── circuit_breaker.py             ← Open/half-open/closed circuit logic
+├── agent/
+│   ├── core.py                        ✅ LangGraph StateGraph, ResearchState, tool dispatch
+│   ├── prompts.py                     ✅ planner, executor, verifier, disambiguator prompts
+│   ├── parser.py                      ✅ plan / ReAct / verification parsing
+│   ├── error_handler.py               ✅ retry, backoff, degradation, failure injector
+│   ├── fallback_chains.py             ✅ fallback chain executor (not wired yet)
+│   ├── circuit_breaker.py             ⏳
+│   ├── query_analyzer.py              ⏳ Day 10
+│   └── disambiguation.py              ⏳ Day 10
 │
-├── tools/                             ← 12-tool registry
-│   ├── tool_registry.py               ← ToolRegistry class (routing, caching, rate limits)
-│   ├── schemas/                       ← LLM-facing JSON schemas for all 12 tools
-│   │   ├── data_retrieval.py          ← sec_filing_search, financial_data_api, ...
-│   │   ├── computation.py             ← calculation_engine, fact_checker, report_gen
-│   │   └── memory.py                  ← vector_db_search, vector_db_store
-│   ├── sec_edgar.py                   ← EDGAR EFTS API (free, no auth)
-│   ├── financial_api.py               ← Financial Modeling Prep + Alpha Vantage
-│   ├── web_search.py                  ← Tavily (primary) + SerpAPI (fallback)
-│   ├── news_sentiment.py              ← NewsAPI + TextBlob/VADER scoring
-│   ├── earnings.py                    ← Earnings call transcripts (FMP)
-│   ├── company_profile.py             ← Company metadata (FMP)
-│   ├── peer_comparison.py             ← Industry peers + comparative metrics
-│   ├── calculator.py                  ← DCF, ratios, margins (local, no API)
-│   ├── fact_checker.py                ← Cross-reference claims across sources
-│   └── report_gen.py                  ← Structured markdown report formatter
+├── tools/
+│   ├── schemas/                       ✅ 12 LLM-facing schemas, ALL_SCHEMAS, FALLBACK_CHAINS
+│   ├── sec_edgar.py                   ✅ filing metadata + full filing text
+│   ├── financial_api.py               ✅ FMP primary, Alpha Vantage fallback
+│   ├── web_search.py                  ✅ Tavily primary, SerpAPI fallback
+│   ├── news_sentiment.py              ✅ NewsAPI + VADER / TextBlob / keyword scoring
+│   ├── company_profile.py             ✅ FMP /profile, /quote fallback
+│   ├── earnings.py                    ✅ FMP transcripts
+│   ├── peer_comparison.py             ✅ FMP peers + metric matrix
+│   ├── calculator.py                  ✅ 9 calculation types, local
+│   ├── fact_checker.py                👤
+│   ├── report_gen.py                  👤
+│   └── tool_registry.py               👤
 │
-├── memory/                            ← Three-layer memory architecture
-│   ├── vector_store.py                ← ChromaDB (dev) / Pinecone (prod)
-│   ├── context_manager.py             ← Sliding window summarization at 70% capacity
-│   └── episodic.py                    ← JSON + SQLite strategy log
+├── memory/
+│   ├── vector_store.py                ✅ ChromaDB, cosine similarity, metadata filtering
+│   ├── vector_db_tools.py             ✅ vector_db_search / vector_db_store tools
+│   ├── context_manager.py             ✅ token budget, summarisation, chunking strategies
+│   └── episodic.py                    ✅ JSONL + SQLite strategy log
 │
-├── synthesis/                         ← Multi-source synthesis engine
-│   ├── engine.py                      ← Source weighting, conflict resolution
-│   ├── conflict_resolver.py           ← 6-step conflict resolution protocol
-│   └── narrative.py                   ← Narrative threading, quantitative triangulation
+├── synthesis/
+│   ├── conflict_resolver.py           ✅ 6-step conflict resolution protocol
+│   ├── narrative.py                   ✅ threading, triangulation, sentiment-fact alignment
+│   └── engine.py                      ✅ orchestrator, wired into node_synthesize
 │
-├── evaluation/                        ← 20+ quality metrics
-│   ├── metrics.py                     ← FA, CO, AD, CS, AB metric categories
-│   ├── dashboard.py                   ← Evaluation summary (4 simulation dimensions)
-│   └── benchmarks/                    ← Baseline comparisons
+├── evaluation/
+│   ├── metrics.py                     ✅ 26 metrics across 5 categories (not yet wired to node_evaluate)
+│   └── dashboard.py                   ⏳
 │
-├── config/
-│   ├── settings.py                    ← Pydantic settings, API key management
-│   ├── llm_client.py                  ← Claude Sonnet 4 primary, GPT-4o-mini fallback
-│   └── logging_config.py              ← Structured JSON logging
-│
-├── tests/
-│   ├── test_tools.py                  ← Tool registry + 3 core tool unit tests
-│   ├── test_memory.py                 ← Vector store and context manager tests
-│   ├── test_agent.py                  ← End-to-end agent workflow tests
-│   └── test_synthesis.py              ← Conflict resolution and synthesis tests
-│
-├── results/                           ← Simulation challenge outputs (Days 11–12)
-│   ├── challenge_1.md
-│   ├── ...
-│   └── challenge_8.md
-│
-└── docs/                              ← Final documentation (Day 14)
-    ├── architecture_specification_final.md
-    ├── trace_gallery.md
-    └── optimization_log.md
+├── config/                            settings and logging (Day 3)
+├── tests/                             test_memory.py, test_challenges_1_2.py, test_day4_challenge1.py
+├── results/                           challenge_1.md, challenge_2.md (mock mode); 3-8 pending
+└── docs/                              ⏳ Day 14
 ```
 
 ---
 
 ## Technology Stack
 
-| Component | Technology | Rationale |
-|-----------|-----------|-----------|
-| Language | Python 3.11+ | Best LLM library ecosystem |
-| Agent Framework | LangGraph 0.1+ | Stateful graph, checkpointing, explicit state transitions |
-| Primary LLM | Claude Sonnet 4 (Anthropic) | 200K context window, strong tool use |
-| Fallback LLM | GPT-4o-mini (OpenAI) | Cost-efficient for summarization sub-tasks |
-| Vector DB (dev) | ChromaDB 0.4+ | Zero setup, local, free |
-| Vector DB (prod) | Pinecone | Managed scaling, metadata filtering |
-| Embeddings | text-embedding-3-small (OpenAI) | 1536 dims native, $0.02/1M tokens |
-| Retry Logic | Tenacity 8.2+ | Declarative exponential backoff |
-| Testing | Pytest 8.0+ | Standard Python testing |
+| Component | Technology | Notes |
+|-----------|-----------|-------|
+| Language | Python 3.11+ | |
+| Agent framework | LangGraph | Explicit `StateGraph` over `ResearchState` |
+| LLM | Anthropic Claude Sonnet 4 | `core.py` can route to Groq (Llama 3.1 8B Instant) first when a Groq key is configured |
+| Vector DB | ChromaDB (local, dev) | Pinecone planned for production |
+| Embeddings | `text-embedding-3-small` (1536 dims) | Falls back to local `all-MiniLM-L6-v2` (384 dims) without an OpenAI key |
+| Retry | stdlib exponential backoff | No tenacity dependency in the retry path |
+| Episodic store | JSONL + SQLite (WAL) | `logs/episodic/` |
 
 ---
 
@@ -151,139 +182,119 @@ Project1A-EyobKebede-AutonomousFinancialResearchAgent/
 ### Prerequisites
 
 - Python 3.11+
-- API keys for: Anthropic, OpenAI, Financial Modeling Prep, Tavily, NewsAPI
+- API keys: Anthropic (or Groq), Financial Modeling Prep, Tavily, NewsAPI. Optional: OpenAI (embeddings), SerpAPI and Alpha Vantage (fallbacks).
 
 ### Installation
 
 ```bash
-# Clone the repository
-git clone https://github.com/jobnovice/Project1A-EyobKebede-AutonomousFinancialResearchAgent.git
+git clone <your-repo-url>
 cd Project1A-EyobKebede-AutonomousFinancialResearchAgent
 
-# Create virtual environment
 python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
+source venv/bin/activate        # Windows: venv\Scripts\activate
 
-# Install dependencies
 pip install -r requirements.txt
+cp .env.example .env            # then add your keys
 ```
 
-### Configure API Keys
+Key names the code actually reads: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `FMP_API_KEY`, `TAVILY_API_KEY`, `SERPAPI_KEY`, `NEWSAPI_KEY`, `ALPHA_VANTAGE_KEY`.
+
+> Free tiers are enough for development: FMP 250 req/day, Tavily 1000/month, NewsAPI 100/day. SEC EDGAR is free with no key.
+
+### Run the tests
+
+Run each file on its own:
 
 ```bash
-# Copy the example env file
-cp .env.example .env
-
-# Edit .env and add your keys:
-# ANTHROPIC_API_KEY=your_key_here
-# OPENAI_API_KEY=your_key_here
-# FMP_API_KEY=your_key_here
-# TAVILY_API_KEY=your_key_here
-# NEWSAPI_KEY=your_key_here
-```
-
-> **Free tiers are sufficient for development.** FMP: 250 req/day. Tavily: 1000/month. NewsAPI: 100/day. SEC EDGAR is completely free.
-
-### Run Tests
-
-```bash
-pytest tests/ -v
+python tests/test_memory.py
+python tests/test_challenges_1_2.py            # mock mode without keys
+source .env && python tests/test_challenges_1_2.py   # live mode (FMP + Anthropic keys present)
+python tests/test_day4_challenge1.py
 ```
 
 ---
 
 ## The 12 Tools
 
-### Data Retrieval (7 tools)
+| Tool | Source | Tier | Built | In `TOOL_DISPATCH` |
+|------|--------|------|-------|--------------------|
+| `sec_filing_search` | SEC EDGAR | 1 | ✅ | ✅ |
+| `financial_data_api` | FMP, Alpha Vantage | 2 | ✅ | ✅ |
+| `company_profile` | FMP | 2 | ✅ | ✅ |
+| `peer_comparison` | FMP | 2 | ✅ | ⏳ |
+| `earnings_transcript` | FMP | 3 | ✅ | ✅ |
+| `web_search` | Tavily, SerpAPI | 4 | ✅ | ✅ |
+| `news_sentiment` | NewsAPI + local NLP | 4 | ✅ | ✅ |
+| `calculation_engine` | local | n/a | ✅ | ⏳ |
+| `fact_checker` | multi-source | composite | 👤 | ⏳ |
+| `report_generator` | local template | n/a | 👤 | ⏳ |
+| `vector_db_search` | ChromaDB | n/a | ✅ | ✅ |
+| `vector_db_store` | ChromaDB | n/a | ✅ | ✅ |
 
-| Tool | Source | Free Tier | Use Case |
-|------|--------|-----------|----------|
-| `sec_filing_search` | EDGAR EFTS | ∞ free | 10-K, 10-Q, 8-K — ground truth |
-| `financial_data_api` | FMP + Alpha Vantage | 250/day | Income statement, ratios, history |
-| `earnings_transcript` | FMP | 250/day | Management commentary, guidance |
-| `web_search` | Tavily + SerpAPI | 1000/month | Recent news, emerging risks |
-| `news_sentiment` | NewsAPI + VADER | 100/day | Aggregate sentiment trends |
-| `company_profile` | FMP | 250/day | Sector, market cap, executives |
-| `peer_comparison` | FMP | 250/day | Competitive positioning |
+### Fallback chains (defined in `tools/schemas/__init__.py`)
 
-### Computation & Verification (3 tools)
-
-| Tool | Notes |
-|------|-------|
-| `calculation_engine` | Local only — DCF, growth rates, margins. No API, no rate limits. |
-| `fact_checker` | Orchestrates 2+ sources to verify any numerical claim before report inclusion |
-| `report_generator` | Template engine + LLM formatting call → structured markdown |
-
-### Memory (2 tools)
-
-| Tool | Notes |
-|------|-------|
-| `vector_db_search` | Always called first — Memory First principle |
-| `vector_db_store` | Called at session end — persists verified findings |
+| Primary | Fallbacks, in order |
+|---------|---------------------|
+| `sec_filing_search` | `vector_db_search`, `web_search` |
+| `financial_data_api` | `sec_filing_search`, `vector_db_search` |
+| `company_profile` | `financial_data_api`, `web_search`, `vector_db_search` |
+| `earnings_transcript` | `web_search`, `vector_db_search` |
+| `web_search` | `news_sentiment`, `vector_db_search` |
+| `news_sentiment` | `web_search`, `vector_db_search` |
+| `peer_comparison` | `web_search`, `financial_data_api` |
 
 ---
 
 ## Source Reliability Hierarchy
 
-The synthesis engine weights all claims by source tier:
-
-| Tier | Weight | Source | Used For |
+| Tier | Weight | Source | Used for |
 |------|--------|--------|----------|
-| 1 | 1.00 | SEC filings (10-K, 10-Q, 8-K) | Ground truth for all numerical data |
-| 2 | 0.90 | Financial data APIs (FMP, FactSet) | Structured metrics, historical series |
+| 1 | 1.00 | SEC filings (10-K, 10-Q, 8-K) | Ground truth for numerical data |
+| 2 | 0.90 | Financial data APIs | Structured metrics, historical series |
 | 3 | 0.75 | Earnings call transcripts | Forward guidance, management tone |
 | 4 | 0.60 | Major news (Reuters, Bloomberg, FT) | Recent events, market context |
-| 5 | 0.20 | Social media, forums | Sentiment signals only — never factual claims |
+| 5 | 0.20 | Social media, forums | Sentiment signals only, never factual claims |
 
-> Note: Tiers 4 and 5 are corrected from the project document, which erroneously inverted them. See ERROR_LOG.md Error 001.
+> Tiers 4 and 5 are corrected from the project brief, which inverted them. See `ERROR_LOG.md`, Error 001.
+
+---
+
+## Error Handling and Degradation
+
+- **Retry:** network and rate-limit errors retry with exponential backoff (rate limits use longer delays). Authentication and missing-key errors are never retried.
+- **Fallbacks:** each external tool has at least two fallbacks. A fallback tool's parameters are translated from the primary's, and empty results count as failures.
+- **Degradation:** if every tool in a chain fails, the section is marked `[DATA UNAVAILABLE]`, the other sections still complete, and the failure is disclosed in the report. Data is never invented to fill a gap.
+- **Disclosure:** fallback use is reported with the substitute's tier and its limitations (for example, memory-sourced data may be stale).
 
 ---
 
 ## Design Constraints
 
-| Constraint | Target | Rationale |
-|-----------|--------|-----------|
-| Max tool calls / task | 20 | Prevent runaway API costs |
-| Max agent iterations | 15 | Prevent infinite loops |
-| Target latency | < 5 min | Usable SLA for urgent requests |
-| Hallucination rate | < 2% | Financial safety requirement |
-| Tool efficiency | > 70% | Cost efficiency |
-| Error recovery rate | > 90% | Production reliability |
+| Constraint | Target |
+|-----------|--------|
+| Max tool calls per task | 20 |
+| Max agent iterations | 15 |
+| Max ReAct cycles per plan step | 3 |
+| Target latency | under 5 min |
+| Hallucination count | 0 |
+| Tool efficiency | at least 70% |
+| Error recovery rate | at least 90% |
 
 ---
 
 ## Error Detection Log
 
-Seven deliberate factual errors were embedded in the project document. All 7 were identified and documented in `ERROR_LOG.md`. Summary:
+Seven deliberate factual errors were embedded in the project brief. All seven were identified and documented in `ERROR_LOG.md`:
 
 | # | Location | Error | Severity |
 |---|----------|-------|----------|
-| 001 | A6.2 Source Hierarchy | Tiers 4 & 5 inverted | High |
-| 002 | A5.2 Metric AB-4 | Multiply → divide | High |
-| 003 | A7.3 SCAP | Wrong year (2007) + wrong act | Medium |
+| 001 | A6.2 Source Hierarchy | Tiers 4 and 5 inverted | High |
+| 002 | A5.2 Metric AB-4 | Multiply instead of divide | High |
+| 003 | A7.3 SCAP | Wrong year (2007) and wrong act | Medium |
 | 004 | C4.2 Indian Filing | Form 20-F is SEC, not MCA | Medium |
-| 005 | C3.2 Hallucination % | 45–60% unsupported/implausible | Medium |
-| 006 | E2.2 Embedding dims | text-embedding-3-large ≠ 1024 dims | Medium |
-| 007 | B3.1 Scoring dims | "Five dimensions" but table has four | Low |
-
----
-
-## Project Timeline
-
-| Day | Deliverable | Status |
-|-----|-------------|--------|
-| 1 | Architecture spec, error log, system diagram | ✅ Complete |
-| 2 | Tool schemas (12 tools), tool registry, unit tests, project scaffold | ✅ Complete |
-| 3 | Environment setup, LLM integration, ChromaDB init | ✅ Complete |
-| 4 | Agent core (LangGraph StateGraph, planner, executor) | 🔲 Next |
-| 5–7 | Tool implementations | 🔲 |
-| 8 | Memory architecture | 🔲 |
-| 9 | Synthesis engine | 🔲 |
-| 10 | Error handling and circuit breakers | 🔲 |
-| 11–12 | 8 simulation challenges | 🔲 |
-| 13 | Stress testing and optimization | 🔲 |
-| 14 | Documentation finalization | 🔲 |
-| 15 | Final submission | 🔲 |
+| 005 | C3.2 Hallucination % | 45-60% unsupported or implausible | Medium |
+| 006 | E2.2 Embedding dims | `text-embedding-3-large` is not 1024 dims | Medium |
+| 007 | B3.1 Scoring dims | "Five dimensions" but the table has four | Low |
 
 ---
 
@@ -293,20 +304,19 @@ Seven deliberate factual errors were embedded in the project document. All 7 wer
 Day-NN: Brief description - EyobKebede
 ```
 
-Example: `Day-02: Tool schemas and registry scaffold - EyobKebede`
+Example: `Day-09: Error handler and fallback chains - EyobKebede`
 
 ---
 
-## Important Implementation Notes
+## Implementation Notes
 
-1. **AB-4 Memory Utilization** is computed as `memory_hits / total_api_calls` (division, not multiplication). See ERROR_LOG.md Error 002.
-
-2. **Embedding dimensions**: `text-embedding-3-small` has **1536 native dimensions**. The vector store schema is initialized accordingly. Do not use `text-embedding-3-large` at default settings without updating the schema.
-
-3. **No investment recommendations**: The system prompt explicitly prohibits buy/sell/hold recommendations. ARA-1 is an analysis tool only.
-
-4. **Graceful degradation**: When all fallbacks fail, the agent marks the section `[DATA UNAVAILABLE]` and completes all other sections. It never fabricates data to fill gaps.
+1. **AB-4 Memory Utilization** is `memory_hits / total_api_calls` (division, not multiplication). See `ERROR_LOG.md`, Error 002.
+2. **`gathered_data` stores each tool's raw output with no wrapper.** Keys are `"{tool_name}_step{step_id}"`. `web_search` and `news_sentiment` carry no ticker, so synthesis matches them to a company through their `query` text.
+3. **`metadata_filter`** (not `filter`) is the vector search filter argument, to avoid shadowing the Python builtin.
+4. **`ContextManager` is created per `run_agent` call**, never shared across sessions.
+5. **Graph order:** `analyze_query → memory_precheck → plan → execute_step`. Memory is checked before planning so the planner knows what is already cached.
+6. **No investment recommendations.** The system prompts prohibit buy/sell/hold language. ARA-1 is an analysis tool only.
 
 ---
 
-*Project: ARA-1 Autonomous Financial Research Agent | Version: 0.3 (Day 3) | Author: Eyob Kebede*
+*ARA-1 Autonomous Financial Research Agent | Version 0.9 (Day 9 in progress) | Author: Eyob Kebede*

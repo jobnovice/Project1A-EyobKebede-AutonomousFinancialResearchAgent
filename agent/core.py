@@ -63,6 +63,7 @@ from tools.report_gen         import report_generator
 from memory.vector_db_tools   import vector_db_search, vector_db_store
 from memory.context_manager   import ContextManager
 from memory.episodic          import get_episodic_memory
+from synthesis.engine         import synthesise   # ✅ Added from File A
 
 # Dispatch table: tool_name → callable
 TOOL_DISPATCH: dict[str, Any] = {
@@ -214,7 +215,7 @@ def _tool_error(tool_name: str, message: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Graph Nodes (unchanged from previous version)
+# Graph Nodes
 # ---------------------------------------------------------------------------
 
 def node_analyze_query(state: ResearchState) -> ResearchState:
@@ -443,7 +444,9 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
             "Context at %.1f%% — compressing TAO traces before step %d.",
             ctx_usage["pct_used"], idx + 1,
         )
-        tool_log = _cm.summarise(state, llm_call_fn=_call_llm, keep_recent=3)#type: ignore
+        tool_log = _cm.summarise(
+            state, llm_call_fn=_call_llm, keep_recent=3#type: ignore
+        )
     if not _cm.has_headroom():
         logger.error("No headroom for step %d — halting.", idx + 1)
         state["error_log"].append("Context window full — execution halted.")
@@ -534,53 +537,30 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
 
 def node_synthesize(state: ResearchState) -> ResearchState:
     """
-    Combine all gathered data into a draft report.
-    Full synthesis engine implemented in synthesis/engine.py (Day 9).
-    This stub assembles gathered data into a structured draft.
+    Combine all gathered data into a structured draft report.
+    Delegates to synthesis/engine.py — applies tier weighting,
+    conflict resolution, narrative threading, and sentiment alignment.
     """
     logger.info("Synthesizing %d data sources...", len(state["gathered_data"]))
-
-    gathered = state["gathered_data"]
-    companies = state.get("companies", ["UNKNOWN"])
-    query = state["raw_query"]
-
-    # Build a simple draft from gathered data
-    sections = [
-        f"# Financial Research Report",
-        f"**Query:** {query}",
-        f"**Companies:** {', '.join(companies)}",
-        f"**Generated:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"**Session:** {state['session_id']}",
-        "",
-        "## Data Sources Retrieved",
-    ]
-
-    for key, result in gathered.items():
-        data = result.get("data")
-        source = result.get("source", key)
-        is_mock = result.get("mock", False)
-        tag = " *(mock)*" if is_mock else ""
-        if data:
-            sections.append(f"- **{source}**{tag}: {str(data)[:300]}")
-        else:
-            note = result.get("note", "No data returned.")
-            sections.append(f"- **{source}**{tag}: {note}")
-
-    sections += [
-        "",
-        "## Research Methodology Notes",
-        f"- Total tool calls made: {state['total_api_calls']}",
-        f"- Memory hits: {state['memory_hits']}",
-        f"- Plan steps executed: {state['current_step_index']}",
-        f"- Conflicts detected: {len(state['conflicts_detected'])}",
-        "",
-        "*Full synthesis with source weighting and conflict resolution: Day 9.*",
-    ]
-
-    draft = "\n".join(sections)
-    logger.info("Draft report assembled (%d chars).", len(draft))
-
-    return {**state, "draft_report": draft}
+    try:
+        result = synthesise(state)#type: ignore
+        logger.info("Synthesis complete: draft=%d chars | resolutions=%d",
+                    len(result.get("draft_report", "")),
+                    len(result.get("conflicts_resolved", [])))
+        return {
+            **state,
+            "draft_report":       result["draft_report"],
+            "conflicts_resolved": result["conflicts_resolved"],
+        }
+    except Exception as e:
+        logger.error("Synthesis engine failed: %s — falling back to minimal draft", e)
+        state["error_log"].append(f"Synthesis error: {e}")
+        draft = (
+            f"# Financial Research Report\n"
+            f"**Query:** {state.get('raw_query', '')}\n\n"
+            f"*Synthesis engine encountered an error: {e}*\n"
+        )
+        return {**state, "draft_report": draft}
 
 
 def node_verify(state: ResearchState) -> ResearchState:
