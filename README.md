@@ -57,17 +57,15 @@ Day 9 reliability is wired into `agent/core.py`: real tool calls use retry/backo
 | `tests/test_challenges_1_2.py` | Challenges 1-2 pass in mock mode |
 | `tests/test_day4_challenge1.py` | Day 4 validation passes |
 | Circuit breaker + fallback chains | 11 focused tests pass (`tests/test_circuit_breaker.py` and `tests/test_fallback_chains.py`), including error classification, probe timeout, and empty-probe recovery |
-| Core reliability integration | 3 focused tests are present in `tests/test_core_reliability.py`; not run in the current Python environment because `anthropic` is unavailable |
-| Tool registry | Tests are present in `tests/test_tools.py`; not run in the current Python environment because `jsonschema` is unavailable |
+| Core reliability integration | 3 focused tests pass in `tests/test_core_reliability.py` using the project `.venv` |
+| Tool registry | 4 isolated registry tests pass; the 3 direct tool-implementation tests were not run because they may call external services |
 | Synthesis, evaluation metrics, error handling, fallback chains | Validated by inline runs during development (conflict resolver, narrative, engine, 26 metrics, 8 error-handler checks, 14 fallback-chain checks). Synthesis/evaluation checks are not yet saved as test files. |
 
-The test files use different runners. Run each file with its appropriate test runner after installing `requirements.txt`; the current environment is missing dependencies needed by the core integration and registry tests.
-
-Focused reliability tests:
+The test files use different runners. Use the project virtual environment after installing `requirements.txt`; for example:
 
 ```bash
-python -m unittest tests.test_circuit_breaker tests.test_fallback_chains
-python -m pytest -q tests/test_core_reliability.py
+.venv/bin/python -m unittest tests.test_circuit_breaker tests.test_fallback_chains
+.venv/bin/python -m pytest -q tests/test_core_reliability.py
 ```
 
 ### Known open items
