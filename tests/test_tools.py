@@ -6,6 +6,8 @@ Synchronized test framework validating tool schema firewalls, routing logic,
 circuit breaker interventions, and downstream stub data integrity.
 """
 import unittest
+from unittest.mock import patch
+from agent.circuit_breaker import CircuitBreaker
 from tools.tool_registry import ToolRegistry
 
 # Import the actual tool functions to test them directly
@@ -24,9 +26,10 @@ class TestToolRegistryAndImplementations(unittest.TestCase):
 
     def test_registry_validation_pass(self):
         """Verifies valid parameters cleanly clear the JSON schema validation pass."""
-        payload = {"ticker": "TSLA",
-                   "filing_type": "10-K", "section": "Item 7"}
-        # FIX: Changed .dispatch() to .execute_with_fallback()
+        self.registry.tools["sec_filing_search"] = lambda **_: {
+            "filing_text": "Annual filing content"
+        }
+        payload = {"ticker": "TSLA", "filing_type": "10-K"}
         response = self.registry.execute_with_fallback(
             "sec_filing_search", payload)
         self.assertEqual(response["status"], "success")
@@ -44,42 +47,51 @@ class TestToolRegistryAndImplementations(unittest.TestCase):
         self.assertIn("Schema validation failed", response["error"])
 
     def test_registry_fallback_automatic_routing(self):
-        """Forces an execution error to verify automatic diversion down the fallback chain."""
-        # FIX: Changed internal state manipulation target from .execution_pool to .tools
-        if "sec_filing_search" in self.registry.tools:
-            del self.registry.tools["sec_filing_search"]
-
-        # FIX: Kept payload clean and matching schema fields so validation passes, forcing an execution fault instead
-        payload = {"ticker": "AAPL",
-                   "filing_type": "10-K", "section": "Item 1A"}
+        """Uses the shared fallback coordinator when the primary is unavailable."""
+        del self.registry.tools["sec_filing_search"]
+        self.registry.tools["vector_db_search"] = lambda **_: {
+            "results_count": 1,
+            "results": [{"content": "Cached filing content"}],
+        }
+        payload = {"ticker": "AAPL", "filing_type": "10-K"}
         response = self.registry.execute_with_fallback(
             "sec_filing_search", payload)
 
-        # Confirms it automatically fell back according to fallback chains setup
         self.assertEqual(response["status"], "recovered_via_fallback")
-        # Checks if it hits the designated target inside FALLBACK_CHAINS
-        self.assertTrue(response["source"] in [
-                        "web_search", "vector_db_search"])
+        self.assertEqual(response["source"], "vector_db_search")
+        self.assertTrue(response["used_fallback"])
 
     def test_registry_circuit_breaker_tripping(self):
-        """Day 3 Test: Confirms consecutive faults trip circuit breaker to OPEN."""
-        # Force the tool to throw a definitive exception on invocation
-        def broken_mock_tool(*args, **kwargs):
+        """Failures recorded by the shared executor trip the registry's breaker."""
+        breaker = CircuitBreaker(failure_threshold=3, reset_timeout_s=60)
+        self.registry = ToolRegistry(circuit_breaker=breaker)
+        primary_calls = 0
+
+        def broken_mock_tool(**kwargs):
+            nonlocal primary_calls
+            primary_calls += 1
             raise RuntimeError("Network timeout simulation")
 
-        self.registry.tools["financial_api"] = broken_mock_tool
-        payload = {"ticker": "AAPL",
-                   "statement_type": "income_statement", "period": "annual"}
+        self.registry.tools["financial_data_api"] = broken_mock_tool
+        self.registry.tools["sec_filing_search"] = lambda **_: {
+            "filing_text": "Fallback filing content"
+        }
+        payload = {
+            "ticker": "AAPL",
+            "statement_type": "income_statement",
+            "period": "annual",
+        }
 
-        # Fire 3 consecutive requests to break threshold limits
-        self.registry.execute_with_fallback("financial_api", payload)
-        self.registry.execute_with_fallback("financial_api", payload)
-        response_three = self.registry.execute_with_fallback(
-            "financial_api", payload)
+        with patch("agent.error_handler.time.sleep"):
+            for _ in range(3):
+                self.registry.execute_with_fallback("financial_data_api", payload)
+            response_after_open = self.registry.execute_with_fallback(
+                "financial_data_api", payload
+            )
 
-        # Inspect state tracking properties
-        cb_state = self.registry.circuit_breakers["financial_api"]["state"]
-        self.assertEqual(cb_state, "OPEN")
+        self.assertEqual(breaker.get_state("financial_data_api"), "OPEN")
+        self.assertEqual(primary_calls, 9)
+        self.assertEqual(response_after_open["source"], "sec_filing_search")
 
     # =========================================================================
     # PART 2: Explicit Tool Implementation Tests

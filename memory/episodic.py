@@ -372,6 +372,8 @@ def _compute_tool_performance(tool_log: list[dict]) -> dict[str, dict]:
     stats: dict[str, dict] = {}
 
     for entry in tool_log:
+        if entry.get("attempt", 1) == 0:
+            continue
         tool = entry.get("tool", "unknown")
         if tool not in stats:
             stats[tool] = {"calls": 0, "successes": 0, "latencies_ms": []}

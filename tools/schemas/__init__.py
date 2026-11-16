@@ -89,7 +89,7 @@ TOOL_TIER: dict[str, int | None] = {
 }
 
 # ---------------------------------------------------------------------------
-# Fallback chain map — used by ToolRegistry for automatic fallback routing
+# Fallback chain map — used by agent.fallback_chains for automatic fallback routing
 # Mirrors Section 5.3 of architecture_specification.md
 # ---------------------------------------------------------------------------
 FALLBACK_CHAINS: dict[str, list[str]] = {

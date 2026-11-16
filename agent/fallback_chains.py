@@ -25,12 +25,11 @@ tools/schemas/__init__.py (Day 2). This module adds the missing HOW:
   5. Transparent disclosure  — fallback use and total failure are reported in the
                                result and in format_degradation_notes().
 
-INTEGRATION WARNING (for the core.py wiring step):
-  core.py stores results as gathered[f"{tool_name}_step{id}"], and synthesis
-  (narrative.py) parses each record by the tool name in its key. If a fallback
-  tool produced the data, store it under the SOURCE tool's name, not the
-  primary's — use gathered_key(chain_result, step_id). Otherwise a web_search
-  result filed under "financial_data_api_step3" would be mis-parsed.
+CORE INTEGRATION:
+  core.py sends real calls through execute_with_fallbacks(), counts physical
+  retries against the global call budget, and stores each result under the
+  actual source tool's name via gathered_key(). This is required because the
+  synthesis layer identifies sources from the gathered_data key.
 """
 
 from __future__ import annotations
@@ -64,7 +63,7 @@ class BreakerLike(Protocol):
     """Interface the circuit breaker must provide (see agent/circuit_breaker.py)."""
     def allow(self, tool_name: str) -> bool: ...
     def record_success(self, tool_name: str) -> None: ...
-    def record_failure(self, tool_name: str) -> None: ...
+    def record_failure(self, tool_name: str, error_type: Optional[str] = None) -> None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +74,13 @@ class BreakerLike(Protocol):
 class ToolAttempt:
     tool:          str
     status:        str                   # success | failed | no_data |
-                                         # skipped_circuit_open | skipped_not_implemented
+                                         # skipped_circuit_open | skipped_not_implemented |
+                                         # skipped_call_budget
     attempts:      int = 0
     error_type:    Optional[str] = None
     error_message: Optional[str] = None
     params:        dict = field(default_factory=dict)
+    attempt_log:   list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -275,6 +276,7 @@ def execute_with_fallbacks(
     breaker: Optional[BreakerLike] = None,
     max_retries: int = 2,
     chains: Optional[dict[str, list[str]]] = None,
+    max_tool_calls: Optional[int] = None,
 ) -> ChainResult:
     """
     Run `tool_name`, then each tool in its fallback chain, until one returns
@@ -288,13 +290,27 @@ def execute_with_fallbacks(
         breaker:     Optional circuit breaker (open circuits are skipped).
         max_retries: Retries per tool for retryable errors (network, rate limit).
         chains:      Override FALLBACK_CHAINS (tests).
+        max_tool_calls: Optional maximum number of physical calls across the chain.
     """
+    if max_retries < 0:
+        raise ValueError("max_retries must be non-negative")
+    if max_tool_calls is not None and max_tool_calls < 0:
+        raise ValueError("max_tool_calls must be non-negative")
+
     context = context or {}
     chains = chains if chains is not None else FALLBACK_CHAINS
     chain = [tool_name] + [t for t in chains.get(tool_name, []) if t != tool_name]
     log: list[ToolAttempt] = []
+    calls_made = 0
 
     for idx, tool in enumerate(chain):
+        remaining_calls = (
+            max_tool_calls - calls_made if max_tool_calls is not None else None
+        )
+        if remaining_calls is not None and remaining_calls <= 0:
+            log.append(ToolAttempt(tool, "skipped_call_budget"))
+            break
+
         fn = dispatch.get(tool)
         if fn is None:
             log.append(ToolAttempt(tool, "skipped_not_implemented"))
@@ -305,22 +321,39 @@ def execute_with_fallbacks(
             continue
 
         tool_params = params if idx == 0 else translate_params(tool_name, tool, params, context)
-        gr = with_graceful_degradation(tool, _raise_on_error(fn), tool_params, context, max_retries)
+        tool_retries = (
+            min(max_retries, remaining_calls - 1)
+            if remaining_calls is not None else max_retries
+        )
+        gr = with_graceful_degradation(
+            tool, _raise_on_error(fn), tool_params, context, tool_retries
+        )
+        calls_made += gr.attempts
 
         if gr.success and has_usable_data(tool, gr.result):
             if breaker is not None:
                 breaker.record_success(tool)
-            log.append(ToolAttempt(tool, "success", gr.attempts, params=tool_params))
+            log.append(ToolAttempt(
+                tool, "success", gr.attempts, params=tool_params,
+                attempt_log=gr.attempt_log,
+            ))
             return _build_success(tool_name, tool, gr.result, log, chain)
 
-        if gr.success:   # call worked but returned nothing — not an outage, don't trip breaker
-            log.append(ToolAttempt(tool, "no_data", gr.attempts,
-                                   error_message="returned no usable data", params=tool_params))
+        if gr.success:
+            # The tool responded, so clear a half-open probe even though its
+            # empty result means the chain should continue to the next source.
+            if breaker is not None:
+                breaker.record_success(tool)
+            log.append(ToolAttempt(
+                tool, "no_data", gr.attempts,
+                error_message="returned no usable data", params=tool_params,
+                attempt_log=gr.attempt_log,
+            ))
         else:
             if breaker is not None:
-                breaker.record_failure(tool)
+                breaker.record_failure(tool, gr.error_type)
             log.append(ToolAttempt(tool, "failed", gr.attempts, gr.error_type,
-                                   gr.error_message, tool_params))
+                                   gr.error_message, tool_params, gr.attempt_log))
 
     return _build_degraded(tool_name, log, chain, context)
 

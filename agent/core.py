@@ -25,9 +25,10 @@ Edges:
 
 import json
 import logging
+import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import anthropic
@@ -64,6 +65,13 @@ from memory.vector_db_tools   import vector_db_search, vector_db_store
 from memory.context_manager   import ContextManager
 from memory.episodic          import get_episodic_memory
 from synthesis.engine         import synthesise   # ✅ Added from File A
+from agent.circuit_breaker import CircuitBreaker
+from agent.fallback_chains import (
+    ChainResult,
+    execute_with_fallbacks,
+    format_degradation_notes,
+    gathered_key,
+)
 
 # Dispatch table: tool_name → callable
 TOOL_DISPATCH: dict[str, Any] = {
@@ -83,6 +91,12 @@ TOOL_DISPATCH: dict[str, Any] = {
 
 logger = logging.getLogger(__name__)
 
+_RETRY_MAX_ATTEMPTS = int(os.getenv("RETRY_MAX_ATTEMPTS", "5"))
+if _RETRY_MAX_ATTEMPTS < 1:
+    raise ValueError("RETRY_MAX_ATTEMPTS must be at least 1")
+MAX_RETRIES_PER_TOOL = _RETRY_MAX_ATTEMPTS - 1
+_CIRCUIT_BREAKER = CircuitBreaker()
+
 
 # ---------------------------------------------------------------------------
 # Design constraints (from architecture spec Section 1.4)
@@ -92,6 +106,10 @@ MAX_ITERATIONS = 15
 MAX_CYCLES_PER_STEP = 3          # ReAct micro-loop limit per plan step
 MODEL = "claude-sonnet-4-20250514"
 MAX_TOKENS = 4096
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +130,7 @@ class ResearchState(TypedDict):
     # Execution
     gathered_data: dict[str, Any]
     tool_call_log: list[dict]
+    chain_results: list[ChainResult]
     memory_hits: int
     total_api_calls: int
     iteration_count: int
@@ -153,65 +172,18 @@ def _call_llm(system: str, user: str, temperature: float = 0.2) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool executor — real dispatch with mock override for testing
+# Mock tool executor — real calls use the shared reliability pipeline
 # ---------------------------------------------------------------------------
 
-def _execute_tool(tool_name: str, params: dict, mock_data: Optional[dict] = None) -> dict:
+def _execute_mock_tool(tool_name: str, params: dict, mock_data: dict) -> dict:
     """
-    Execute a tool call.
+    Return an explicitly supplied mock result without invoking real tools.
 
-    Priority:
-      1. If mock_data contains tool_name → return mock result (test mode)
-      2. If tool_name is in TOOL_DISPATCH → call the real implementation
-      3. Otherwise → return stub response (tool not yet implemented)
-
-    All real tool calls are wrapped in try/except so a failure returns a
-    structured error dict instead of crashing the agent. The executor's
-    fallback logic then handles the error via the fallback chain.
+    Production dispatch is handled by execute_with_fallbacks() so retries,
+    fallback selection, circuit breaking, and degradation stay centralized.
     """
-    # 1. Mock override (testing / offline runs)
-    if mock_data and tool_name in mock_data:
-        logger.info("MOCK tool call: %s | params=%s", tool_name, params)
-        return {"source": tool_name, "data": mock_data[tool_name], "mock": True}
-
-    # 2. Real tool dispatch
-    if tool_name in TOOL_DISPATCH:
-        fn = TOOL_DISPATCH[tool_name]
-        logger.info("REAL tool call: %s | params=%s", tool_name, params)
-        try:
-            result = fn(**params)
-            # All real tools return a dict with an 'error' key
-            if result.get("error"):
-                logger.warning("Tool %s returned error: %s", tool_name, result["error"])
-            return result
-        except TypeError as e:
-            # Param mismatch — log and return structured error
-            logger.error("Tool %s param error: %s | params=%s", tool_name, e, params)
-            return _tool_error(tool_name, f"Parameter error: {e}")
-        except Exception as e:
-            logger.error("Tool %s raised unexpected error: %s", tool_name, e)
-            return _tool_error(tool_name, str(e))
-
-    # 3. Stub — tool not yet implemented
-    logger.info("STUB tool call: %s | params=%s", tool_name, params)
-    return {
-        "source": tool_name,
-        "data": None,
-        "mock": False,
-        "error": None,
-        "note": f"Tool '{tool_name}' not yet implemented. Scheduled for Days 6–7.",
-    }
-
-
-def _tool_error(tool_name: str, message: str) -> dict:
-    """Structured error response — signals the executor to try a fallback."""
-    return {
-        "source":  tool_name,
-        "data":    None,
-        "mock":    False,
-        "error":   message,
-        "note":    f"Tool '{tool_name}' failed: {message}",
-    }
+    logger.info("MOCK tool call: %s | params=%s", tool_name, params)
+    return {"source": tool_name, "data": mock_data[tool_name], "mock": True}
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +393,7 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
 
     gathered = state.get("gathered_data", {})
     tool_log = state.get("tool_call_log", [])
+    chain_results = state.get("chain_results", [])
     total_calls = state.get("total_api_calls", 0)
     iteration_count = state.get("iteration_count", 0)
 
@@ -457,6 +430,11 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
     step_complete = False
 
     for cycle in range(MAX_CYCLES_PER_STEP):
+        if total_calls >= MAX_TOOL_CALLS:
+            logger.warning("Max tool calls (%d) reached during step %d.", MAX_TOOL_CALLS, idx + 1)
+            state["error_log"].append("Max tool call limit reached.")
+            break
+
         user_msg = (
             f"Current plan step ({idx + 1}/{len(plan)}):\n"
             f"{json.dumps(step, indent=2)}\n\n"
@@ -474,24 +452,100 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
 
         # Execute the tool
         tool_result = {}
+        chain_result: Optional[ChainResult] = None
         if react.tool_name:
-            tool_result = _execute_tool(react.tool_name, react.tool_params, mock_data)
-            total_calls += 1
             iteration_count += 1
 
-            # Log the tool call
-            tool_log.append({
-                "step_id": step["step_id"],
-                "cycle": cycle + 1,
-                "tool": react.tool_name,
-                "params": react.tool_params,
-                "thought": react.thought,
-                "result_summary": str(tool_result.get("data", ""))[:200],
-                "timestamp": datetime.utcnow().isoformat(),
-            })
+            if mock_data and react.tool_name in mock_data:
+                tool_result = _execute_mock_tool(
+                    react.tool_name, react.tool_params, mock_data
+                )
+                total_calls += 1
+                tool_log.append({
+                    "step_id": step["step_id"],
+                    "cycle": cycle + 1,
+                    "tool": react.tool_name,
+                    "params": react.tool_params,
+                    "thought": react.thought,
+                    "status": "success",
+                    "attempt": 1,
+                    "result_summary": str(tool_result.get("data", ""))[:200],
+                    "timestamp": _utcnow_iso(),
+                })
+                key = f"{react.tool_name}_step{step['step_id']}"
+            else:
+                company = (
+                    react.tool_params.get("ticker")
+                    or (state.get("companies") or [None])[0]
+                    or ""
+                )
+                context = {
+                    "company": company,
+                    "query": state.get("raw_query", ""),
+                }
+                chain_result = execute_with_fallbacks(
+                    tool_name=react.tool_name,
+                    params=react.tool_params,
+                    dispatch=TOOL_DISPATCH,
+                    context=context,
+                    breaker=_CIRCUIT_BREAKER,
+                    max_retries=MAX_RETRIES_PER_TOOL,
+                    max_tool_calls=MAX_TOOL_CALLS - total_calls,
+                )
+                tool_result = chain_result.result
+                total_calls += sum(attempt.attempts for attempt in chain_result.attempts)
+                chain_results.append(chain_result)
 
-            # Store result in gathered_data keyed by tool + step
-            key = f"{react.tool_name}_step{step['step_id']}"
+                result_summary = str(tool_result)[:200]
+                for tool_attempt in chain_result.attempts:
+                    if tool_attempt.attempt_log:
+                        for physical_attempt in tool_attempt.attempt_log:
+                            status = physical_attempt["status"]
+                            if tool_attempt.status == "no_data":
+                                status = "no_data"
+                            tool_log.append({
+                                "step_id": step["step_id"],
+                                "cycle": cycle + 1,
+                                "tool": tool_attempt.tool,
+                                "requested_tool": react.tool_name,
+                                "params": tool_attempt.params,
+                                "thought": react.thought,
+                                "status": status,
+                                "attempt": physical_attempt["attempt"],
+                                "error_type": physical_attempt.get("error_type"),
+                                "error_message": physical_attempt.get("error_message"),
+                                "retry_delay_s": physical_attempt.get("retry_delay_s", 0.0),
+                                "source_tool": chain_result.source_tool,
+                                "used_fallback": chain_result.used_fallback,
+                                "degraded": chain_result.degraded,
+                                "result_summary": (
+                                    result_summary
+                                    if status == "success"
+                                    and tool_attempt.tool == chain_result.source_tool
+                                    else ""
+                                ),
+                                "timestamp": _utcnow_iso(),
+                            })
+                    else:
+                        tool_log.append({
+                            "step_id": step["step_id"],
+                            "cycle": cycle + 1,
+                            "tool": tool_attempt.tool,
+                            "requested_tool": react.tool_name,
+                            "params": tool_attempt.params,
+                            "thought": react.thought,
+                            "status": tool_attempt.status,
+                            "attempt": 0,
+                            "error_type": tool_attempt.error_type,
+                            "error_message": tool_attempt.error_message,
+                            "source_tool": chain_result.source_tool,
+                            "used_fallback": chain_result.used_fallback,
+                            "degraded": chain_result.degraded,
+                            "result_summary": "",
+                            "timestamp": _utcnow_iso(),
+                        })
+                key = gathered_key(chain_result, step["step_id"])
+
             gathered[key] = tool_result
 
         # Evaluate decision
@@ -501,6 +555,13 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
             step_complete = True
             break
         elif decision == "fallback_needed":
+            if chain_result and (chain_result.used_fallback or chain_result.degraded):
+                logger.info(
+                    "Shared fallback chain already handled %s; not repeating fallback.",
+                    react.tool_name,
+                )
+                step_complete = True
+                break
             fallback = step.get("fallback_if_fails")
             if fallback:
                 logger.info("Fallback triggered: switching to %s", fallback)
@@ -529,6 +590,7 @@ def node_execute_step(state: ResearchState, mock_data: Optional[dict] = None, co
         **state,
         "gathered_data": gathered,
         "tool_call_log": tool_log,
+        "chain_results": chain_results,
         "total_api_calls": total_calls,
         "iteration_count": iteration_count,
         "current_step_index": idx + 1,
@@ -602,7 +664,7 @@ def node_generate_report(state: ResearchState) -> ResearchState:
     Full template engine in report_gen.py (Day 7).
     """
     logger.info("Generating final report...")
-    draft = state.get("draft_report", "No data retrieved.")
+    draft = state.get("draft_report") or "No data retrieved."
     hallucination_count = state.get("hallucination_count", 0)
 
     if hallucination_count > 0:
@@ -615,10 +677,26 @@ def node_generate_report(state: ResearchState) -> ResearchState:
     else:
         final = draft
 
+    availability_notes = format_degradation_notes(state.get("chain_results", []))
+    if availability_notes:
+        final += "\n\n" + availability_notes
+
+    chain_results = state.get("chain_results", [])
+    confidence_scores = dict(state.get("confidence_scores", {}))
+    if chain_results:
+        unavailable = sum(result.degraded for result in chain_results)
+        data_availability = (len(chain_results) - unavailable) / len(chain_results)
+        confidence_scores["data_availability"] = round(data_availability, 3)
+        if unavailable and confidence_scores.get("overall") is not None:
+            confidence_scores["overall"] = round(
+                confidence_scores["overall"] * data_availability, 3
+            )
+
     return {
         **state,
         "final_report": final,
-        "completed_at": datetime.utcnow().isoformat(),
+        "confidence_scores": confidence_scores,
+        "completed_at": _utcnow_iso(),
     }
 
 
@@ -634,15 +712,21 @@ def node_evaluate(state: ResearchState) -> ResearchState:
     # AB-4: Memory Utilization = memory_hits / total_api_calls (division, not multiplication)
     ab4 = round(memory_hits / total_calls, 3) if total_calls > 0 else 0.0
 
-    # AB-1: Tool Efficiency — stub (all calls counted as useful until real tool data available)
-    ab1 = round(len(tool_log) / max(total_calls, 1), 3)
+    # AB-1: successful physical tool attempts divided by all physical attempts.
+    ab1 = round(
+        sum(1 for entry in tool_log if entry.get("status") == "success")
+        / max(total_calls, 1),
+        3,
+    )
 
     metrics = {
         "AB-1_tool_efficiency": ab1,
         "AB-4_memory_utilization": ab4,
         "AB-5_latency_seconds": None,          # computed externally
         "FA-5_hallucination_count": state.get("hallucination_count", 0),
-        "CO-2_source_types_used": len({e["tool"] for e in tool_log}),
+        "CO-2_source_types_used": len({
+            entry["tool"] for entry in tool_log if entry.get("attempt", 0) > 0
+        }),
         "overall_confidence": state.get("confidence_scores", {}).get("overall", None),
         "plan_steps_completed": state.get("current_step_index", 0),
         "total_tool_calls": total_calls,
@@ -690,7 +774,7 @@ def build_graph(mock_data: Optional[dict] = None, session_cm: Optional["ContextM
 
     # Use the CM passed in from run_agent (created fresh per query in run_agent).
     _session_cm = session_cm or ContextManager(
-        session_id=f"session-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+        session_id=f"session-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
     )
 
     # Wrap execute_step to pass mock_data and the session-scoped CM
@@ -746,7 +830,7 @@ def run_agent(query: str, mock_data: Optional[dict] = None) -> ResearchState:
     Returns:
         Final ResearchState with completed report and evaluation metrics.
     """
-    session_id = f"session-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+    session_id = f"session-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}"
     logger.info("ARA-1 starting | session=%s | query=%s", session_id, query)
     start = time.time()
 
@@ -760,6 +844,7 @@ def run_agent(query: str, mock_data: Optional[dict] = None) -> ResearchState:
         "plan_revision_count": 0,
         "gathered_data": {},
         "tool_call_log": [],
+        "chain_results": [],
         "memory_hits": 0,
         "total_api_calls": 0,
         "iteration_count": 0,

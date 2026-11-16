@@ -19,7 +19,7 @@ ARA-1 is a purpose-built agentic AI system that replicates the core workflow of 
 
 ### Where we are right now
 
-Day 9 (error handling) is partly done. Retry/degradation and the fallback-chain executor are built and tested in isolation. The circuit breaker is next, followed by wiring all of it into `agent/core.py`. After that comes Challenge 6.
+Day 9 reliability is wired into `agent/core.py`: real tool calls use retry/backoff, fallback chains, per-tool circuit breaking, call-budget accounting, and report disclosures. Next is full-agent failure injection and Challenge 6.
 
 ### Progress by day
 
@@ -31,7 +31,7 @@ Day 9 (error handling) is partly done. Retry/degradation and the fallback-chain 
 | 4 | Core agent loop (`prompts.py`, `parser.py`, `core.py`) | ✅ Challenge 1 validated with mock data |
 | 5 | Real API tools: SEC EDGAR, financial data, web search, news sentiment, company profile | ✅ Challenges 1-2 pass in **mock mode only**; live-API runs not done |
 | 6 | Memory: vector store, context manager, episodic memory | ✅ 39 tests in `tests/test_memory.py` |
-| 7 | Remaining tools: earnings, peer comparison, calculator, fact checker, report generator | ✅ per owner. Tools not all wired into `TOOL_DISPATCH`; Challenges 3-4 results not recorded |
+| 7 | Remaining tools: earnings, peer comparison, calculator, fact checker, report generator | ✅ tools are present in `TOOL_DISPATCH`; Challenges 3-4 results not recorded |
 | 8 | Synthesis: conflict resolver, narrative, engine | ✅ engine wired into `node_synthesize` |
 | 9 | Error handling | 🟡 in progress, see below |
 | 10 | Query analysis and disambiguation, Challenge 7 | ⏳ |
@@ -42,9 +42,10 @@ Day 9 (error handling) is partly done. Retry/degradation and the fallback-chain 
 | Deliverable | Status |
 |-------------|--------|
 | `agent/error_handler.py`: retry with exponential backoff, `[DATA UNAVAILABLE]` degradation, failure injector | ✅ |
-| `agent/fallback_chains.py`: chain executor, parameter translation, usable-data check, disclosure notes | ✅ not yet wired into `core.py` |
-| `agent/circuit_breaker.py` | ⏳ next. Interface it must provide: `allow(tool)`, `record_success(tool)`, `record_failure(tool)` |
-| Wire error handling + fallbacks + breaker into `core.py` | ⏳ |
+| `agent/fallback_chains.py`: chain executor, parameter translation, usable-data check, disclosure notes | ✅ shared by `ToolRegistry` and `core.py` |
+| `agent/circuit_breaker.py`: per-tool closed/open/half-open states and single recovery probe | ✅ implemented and unit-tested |
+| `tools/tool_registry.py`: schema validation and shared retry/fallback/breaker delegation | ✅ duplicate fallback and breaker logic removed |
+| Wire error handling + fallbacks + breaker into `core.py` | ✅ retries and fallback attempts count toward the tool-call budget; outputs keep actual source attribution; report includes availability notes |
 | `results/challenge_6.md` (ambiguous query handling) | ⏳ |
 | Failure injection against the full agent | ⏳ (done against the chain executor only: at a 50% injected failure rate, retries alone recovered 89.7% of calls and retries plus fallbacks recovered 100%, over 300 seeded runs) |
 
@@ -55,20 +56,28 @@ Day 9 (error handling) is partly done. Retry/degradation and the fallback-chain 
 | `tests/test_memory.py` | 39 tests pass |
 | `tests/test_challenges_1_2.py` | Challenges 1-2 pass in mock mode |
 | `tests/test_day4_challenge1.py` | Day 4 validation passes |
-| Synthesis, evaluation metrics, error handling, fallback chains | Validated by inline runs during development (conflict resolver, narrative, engine, 26 metrics, 8 error-handler checks, 14 fallback-chain checks). **Not yet saved as test files.** |
+| Circuit breaker + fallback chains | 11 focused tests pass (`tests/test_circuit_breaker.py` and `tests/test_fallback_chains.py`), including error classification, probe timeout, and empty-probe recovery |
+| Core reliability integration | 3 focused tests are present in `tests/test_core_reliability.py`; not run in the current Python environment because `anthropic` is unavailable |
+| Tool registry | Tests are present in `tests/test_tools.py`; not run in the current Python environment because `jsonschema` is unavailable |
+| Synthesis, evaluation metrics, error handling, fallback chains | Validated by inline runs during development (conflict resolver, narrative, engine, 26 metrics, 8 error-handler checks, 14 fallback-chain checks). Synthesis/evaluation checks are not yet saved as test files. |
 
-Test files are script-style runners that stub external packages (`chromadb`, `anthropic`, `langgraph`) at import time. Run them one at a time, not together under a single `pytest` session.
+The test files use different runners. Run each file with its appropriate test runner after installing `requirements.txt`; the current environment is missing dependencies needed by the core integration and registry tests.
+
+Focused reliability tests:
+
+```bash
+python -m unittest tests.test_circuit_breaker tests.test_fallback_chains
+python -m pytest -q tests/test_core_reliability.py
+```
 
 ### Known open items
 
-1. **`.env.example` key mismatch:** it lists `ALPHA_VANTAGE_API_KEY`, but `tools/financial_api.py` reads `ALPHA_VANTAGE_KEY`. Until one is renamed, the Alpha Vantage fallback is silently disabled.
-2. **Tools not yet in `TOOL_DISPATCH`:** `peer_comparison`, `calculation_engine`, `fact_checker`, `report_generator`. Wiring is deferred until all tools are done.
-3. **No automatic memory write:** the graph has no step that stores verified findings in long-term memory at session end. `vector_db_store` is only used if the plan calls it, so cross-session cache hits depend on that. Challenge 7 (memory-driven research) needs this.
-4. **Fallback results must be filed under the tool that produced them** (use `gathered_key()` from `fallback_chains.py`). Synthesis parses each record by the tool name in its key.
-5. **`node_evaluate` and `node_generate_report` are still basic.** `evaluation/metrics.py` (26 metrics) and `tools/report_gen.py` are not yet connected to them.
-6. **`fact_checker` (👤):** confirm it calls `financial_data_api(..., limit=1)` (not `years=`) and returns a `verified` boolean. `vector_db_store` depends on that flag.
-7. **Live-API runs:** Challenges 1-2 have only been run with mock data.
-8. **Embedding model:** without an OpenAI key, `vector_store.py` falls back to a local 384-dimension model. Do not mix embedding models in one ChromaDB collection.
+1. **No automatic memory write:** the graph has no step that stores verified findings in long-term memory at session end. `vector_db_store` is only used if the plan calls it, so cross-session cache hits depend on that. Challenge 7 (memory-driven research) needs this.
+2. **`node_evaluate` and `node_generate_report` are still basic.** `evaluation/metrics.py` (26 metrics) and `tools/report_gen.py` are not yet connected to them.
+3. **`fact_checker` (👤):** confirm it calls `financial_data_api(..., limit=1)` (not `years=`) and returns a `verified` boolean. `vector_db_store` depends on that flag.
+4. **Live-API runs:** Challenges 1-2 have only been run with mock data.
+5. **Embedding model:** without an OpenAI key, `vector_store.py` falls back to a local 384-dimension model. Do not mix embedding models in one ChromaDB collection.
+6. **Circuit-breaker timeout mismatch:** architecture §8.3 specifies a five-minute half-open delay; current code/config defaults to 60 seconds via `CIRCUIT_BREAKER_TIMEOUT`. Resolve before treating the default as production policy.
 
 ---
 
@@ -89,8 +98,8 @@ plan                       ← Planner LLM, sees cache summary + episodic memory
     ▼
 execute_step  ⟲            ← ReAct loop per plan step (max 20 tool calls, 15 iterations)
     │                         ContextManager compresses old traces at 70% of the context window
-    ├── Tool registry (12 tools)
-    └── Error handling: retry → fallback chain → circuit breaker → degrade   (built, wiring pending)
+    ├── Tool dispatch (12 tools)
+    └── Error handling: retry → fallback chain → circuit breaker → degrade   (wired into core)
     │
     ▼
 synthesize                 ← synthesis engine: conflict resolution, narrative threading,
@@ -121,8 +130,8 @@ Project1A-EyobKebede-AutonomousFinancialResearchAgent/
 │   ├── prompts.py                     ✅ planner, executor, verifier, disambiguator prompts
 │   ├── parser.py                      ✅ plan / ReAct / verification parsing
 │   ├── error_handler.py               ✅ retry, backoff, degradation, failure injector
-│   ├── fallback_chains.py             ✅ fallback chain executor (not wired yet)
-│   ├── circuit_breaker.py             ⏳
+│   ├── fallback_chains.py             ✅ executor; shared by ToolRegistry and core
+│   ├── circuit_breaker.py             ✅ per-tool circuit breaker
 │   ├── query_analyzer.py              ⏳ Day 10
 │   └── disambiguation.py              ⏳ Day 10
 │
@@ -169,7 +178,7 @@ Project1A-EyobKebede-AutonomousFinancialResearchAgent/
 |-----------|-----------|-------|
 | Language | Python 3.11+ | |
 | Agent framework | LangGraph | Explicit `StateGraph` over `ResearchState` |
-| LLM | Anthropic Claude Sonnet 4 | `core.py` can route to Groq (Llama 3.1 8B Instant) first when a Groq key is configured |
+| LLM | Anthropic Claude Sonnet 4 | Used by `agent/core.py` |
 | Vector DB | ChromaDB (local, dev) | Pinecone planned for production |
 | Embeddings | `text-embedding-3-small` (1536 dims) | Falls back to local `all-MiniLM-L6-v2` (384 dims) without an OpenAI key |
 | Retry | stdlib exponential backoff | No tenacity dependency in the retry path |
@@ -221,13 +230,13 @@ python tests/test_day4_challenge1.py
 | `sec_filing_search` | SEC EDGAR | 1 | ✅ | ✅ |
 | `financial_data_api` | FMP, Alpha Vantage | 2 | ✅ | ✅ |
 | `company_profile` | FMP | 2 | ✅ | ✅ |
-| `peer_comparison` | FMP | 2 | ✅ | ⏳ |
+| `peer_comparison` | FMP | 2 | ✅ | ✅ |
 | `earnings_transcript` | FMP | 3 | ✅ | ✅ |
 | `web_search` | Tavily, SerpAPI | 4 | ✅ | ✅ |
 | `news_sentiment` | NewsAPI + local NLP | 4 | ✅ | ✅ |
-| `calculation_engine` | local | n/a | ✅ | ⏳ |
-| `fact_checker` | multi-source | composite | 👤 | ⏳ |
-| `report_generator` | local template | n/a | 👤 | ⏳ |
+| `calculation_engine` | local | n/a | ✅ | ✅ |
+| `fact_checker` | multi-source | composite | 👤 | ✅ |
+| `report_generator` | local template | n/a | 👤 | ✅ |
 | `vector_db_search` | ChromaDB | n/a | ✅ | ✅ |
 | `vector_db_store` | ChromaDB | n/a | ✅ | ✅ |
 

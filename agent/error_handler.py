@@ -30,6 +30,7 @@ Architecture spec §9.1 degradation protocol:
 from __future__ import annotations
 
 import logging
+import re
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -47,15 +48,26 @@ DEFAULT_MAX_DELAY      = 30.0     # seconds
 RATE_LIMIT_BASE_DELAY  = 5.0      # longer backoff for 429s
 RATE_LIMIT_MAX_DELAY   = 60.0
 
-# HTTP status codes that should NOT be retried
-NO_RETRY_CODES = {401, 403, 404, 422}
-
 # Error substrings that signal a rate limit
 RATE_LIMIT_SIGNALS = {"429", "rate limit", "too many requests", "quota exceeded"}
 
 # Error substrings that signal auth failure (no retry)
 AUTH_FAILURE_SIGNALS = {"401", "403", "unauthorized", "forbidden", "invalid api key",
                         "api key not configured", "not configured"}
+
+DATA_SIGNALS = {"no data", "returned no", "not found", "no results", "no transcript", "no record",
+                "empty response", "empty result", "empty response from", "could not find"}
+
+INVALID_PARAM_SIGNALS = {
+    "typeerror",
+    "unexpected keyword argument",
+    "unexpected positional argument",
+    "missing required positional argument",
+    "unsupported parameter",
+    "invalid parameter",
+    "invalid parameters",
+    "got an unexpected keyword argument",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -77,11 +89,20 @@ class GracefulResult:
     error_message:  Optional[str]
     degraded:       bool               # True if [DATA UNAVAILABLE] was substituted
     retrieved_at:   str = field(default_factory=lambda: _now())
+    attempt_log:    list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
 # Error classification
 # ---------------------------------------------------------------------------
+
+def _http_status_code(message: str) -> int | None:
+    """Extract a status code such as HTTP 404 or status=503 from the error text."""
+    match = re.search(r"(?:http\s+|status(?:\s+code)?\s+|status=)(\d{3})(?:\b|$)", message, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
+
 
 def _classify_error(exc: Exception) -> tuple[str, bool]:
     """
@@ -89,6 +110,22 @@ def _classify_error(exc: Exception) -> tuple[str, bool]:
     Returns (error_type, is_retryable).
     """
     msg = str(exc).lower()
+    status_code = _http_status_code(msg)
+
+    if isinstance(exc, TypeError) or any(s in msg for s in INVALID_PARAM_SIGNALS):
+        return "invalid_params", False
+
+    if status_code is not None:
+        if status_code in {401, 403}:
+            return "auth", False
+        if status_code == 404:
+            return "data", False
+        if status_code == 422:
+            return "invalid_params", False
+        if status_code == 429:
+            return "rate_limit", True
+        if 500 <= status_code <= 599:
+            return "network", True
 
     if any(s in msg for s in AUTH_FAILURE_SIGNALS):
         return "auth", False
@@ -96,13 +133,10 @@ def _classify_error(exc: Exception) -> tuple[str, bool]:
     if any(s in msg for s in RATE_LIMIT_SIGNALS):
         return "rate_limit", True
 
-    if any(code in msg for code in [str(c) for c in NO_RETRY_CODES]):
-        return "auth", False
-
     if any(s in msg for s in ["network", "connection", "timeout", "urlopen", "socket"]):
         return "network", True
 
-    if any(s in msg for s in ["empty", "no data", "not found", "returned no"]):
+    if any(s in msg for s in DATA_SIGNALS) or "no " in msg and " found" in msg:
         return "data", False   # retrying won't help with empty data
 
     return "unknown", True
@@ -129,6 +163,7 @@ def retry_with_backoff(
     max_delay: float = DEFAULT_MAX_DELAY,
     tool_name: str = "unknown",
     _delay_tracker: Optional[list[float]] = None,
+    _attempt_tracker: Optional[list[dict[str, Any]]] = None,
     **kwargs,
 ) -> tuple[Any, int, float]:
     """
@@ -156,6 +191,14 @@ def retry_with_backoff(
     for attempt in range(max_retries + 1):
         try:
             result = fn(*args, **kwargs)
+            if _attempt_tracker is not None:
+                _attempt_tracker.append({
+                    "attempt": attempt + 1,
+                    "status": "success",
+                    "error_type": None,
+                    "error_message": None,
+                    "retry_delay_s": 0.0,
+                })
             if attempt > 0:
                 logger.info(
                     "[%s] Succeeded on attempt %d/%d after %.1fs total delay.",
@@ -166,6 +209,20 @@ def retry_with_backoff(
         except Exception as exc:
             last_exc = exc
             error_type, retryable = _classify_error(exc)
+            retry_delay = 0.0
+            if retryable and attempt < max_retries:
+                b = RATE_LIMIT_BASE_DELAY if error_type == "rate_limit" else base_delay
+                m = RATE_LIMIT_MAX_DELAY if error_type == "rate_limit" else max_delay
+                retry_delay = _compute_delay(attempt, b, m)
+            if _attempt_tracker is not None:
+                _attempt_tracker.append({
+                    "attempt": attempt + 1,
+                    "status": "failed",
+                    "error_type": error_type,
+                    "error_message": str(exc),
+                    "retryable": retryable,
+                    "retry_delay_s": retry_delay,
+                })
 
             if not retryable:
                 logger.warning(
@@ -175,18 +232,14 @@ def retry_with_backoff(
                 raise
 
             if attempt < max_retries:
-                # Use longer delays for rate limits
-                b = RATE_LIMIT_BASE_DELAY if error_type == "rate_limit" else base_delay
-                m = RATE_LIMIT_MAX_DELAY  if error_type == "rate_limit" else max_delay
-                delay = _compute_delay(attempt, b, m)
-                total_delay += delay
+                total_delay += retry_delay
                 if _delay_tracker is not None:
-                    _delay_tracker.append(delay)
+                    _delay_tracker.append(retry_delay)
                 logger.warning(
                     "[%s] Attempt %d/%d failed (%s): %s. Retrying in %.1fs...",
-                    tool_name, attempt + 1, max_retries + 1, error_type, exc, delay
+                    tool_name, attempt + 1, max_retries + 1, error_type, exc, retry_delay
                 )
-                time.sleep(delay)
+                time.sleep(retry_delay)
             else:
                 logger.error(
                     "[%s] All %d attempts failed. Last error: %s",
@@ -239,6 +292,7 @@ def with_graceful_degradation(
     # Single retry path: stdlib backoff with error classification
     call_count = [0]
     retry_delays: list[float] = []
+    attempt_log: list[dict[str, Any]] = []
 
     def _counted(**kw):
         call_count[0] += 1
@@ -247,12 +301,13 @@ def with_graceful_degradation(
     try:
         result, attempts, delay = retry_with_backoff(
             _counted, max_retries=max_retries, tool_name=tool_name,
-            _delay_tracker=retry_delays, **params
+            _delay_tracker=retry_delays, _attempt_tracker=attempt_log, **params
         )
         return GracefulResult(
             tool_name=tool_name, result=result, success=True,
             attempts=attempts, total_delay_s=delay,
             error_type=None, error_message=None, degraded=False,
+            attempt_log=attempt_log,
         )
 
     except Exception as exc:
@@ -275,6 +330,7 @@ def with_graceful_degradation(
             error_type=error_type,
             error_message=error_msg,
             degraded=True,
+            attempt_log=attempt_log,
         )
 
 
